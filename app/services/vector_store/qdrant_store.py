@@ -13,6 +13,7 @@ from qdrant_client.http.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    PayloadSchemaType,
     PointStruct,
     VectorParams,
 )
@@ -23,6 +24,11 @@ from app.config.config import settings
 logger = logging.getLogger(__name__)
 
 DEFAULT_UPSERT_BATCH_SIZE = 64
+
+# Payload fields used in filters (purge, clone, class-scoped retrieval). Qdrant
+# rejects a filtered request when the field has no index, so they are created
+# alongside the collection rather than left to whoever populated it.
+INDEXED_PAYLOAD_FIELDS = ("metadata.document_id", "metadata.class_id")
 
 
 def _is_retryable_qdrant_error(error: BaseException) -> bool:
@@ -198,6 +204,18 @@ class QdrantStore:
                 vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
             )
 
+        existing = set(self.client.get_collection(self.collection_name).payload_schema)
+        for field in INDEXED_PAYLOAD_FIELDS:
+            if field in existing:
+                continue
+            logger.info("Creating Qdrant payload index on '%s'", field)
+            self.client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name=field,
+                field_schema=PayloadSchemaType.KEYWORD,
+                wait=True,
+            )
+
     @retry(
         retry=retry_if_exception(_is_retryable_qdrant_error),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -344,6 +362,51 @@ class QdrantStore:
                 ]
             )
         return self.vector_store.similarity_search_with_score(query, k=k, filter=query_filter)
+
+    @retry(
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(5),
+        before_sleep=lambda retry_state: logger.warning(
+            "Retrying Qdrant vector scored search... Attempt %s. Error: %s",
+            retry_state.attempt_number,
+            getattr(retry_state.outcome, "exception", lambda: None)() or "unknown error",
+        ),
+    )
+    def similarity_search_by_vector_with_score(
+        self,
+        embedding: list[float],
+        k: int | None = None,
+        *,
+        class_id: str | None = None,
+    ) -> list[tuple[Document, float]]:
+        """Return ``(chunk, score)`` pairs using a pre-computed vector.
+
+        AI-91 (AC-01): Reuses query embedding from retrieval to avoid calling
+        the embedding API twice.
+        """
+        k = k or settings.retriever_top_k
+        query_filter = None
+        if class_id:
+            query_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="metadata.class_id",
+                        match=MatchValue(value=str(class_id)),
+                    )
+                ]
+            )
+        if hasattr(self.vector_store, "similarity_search_with_score_by_vector"):
+            return self.vector_store.similarity_search_with_score_by_vector(
+                embedding, k=k, filter=query_filter
+            )
+        if hasattr(self.vector_store, "similarity_search_by_vector_with_score"):
+            return self.vector_store.similarity_search_by_vector_with_score(
+                embedding, k=k, filter=query_filter
+            )
+        raise AttributeError(
+            f"Vector store {type(self.vector_store).__name__} does not implement "
+            "similarity_search_with_score_by_vector or similarity_search_by_vector_with_score"
+        )
 
     def as_retriever(self, **kwargs):
         """Get the underlying Qdrant vector store as a LangChain retriever.

@@ -17,6 +17,7 @@ from app.core.security import create_access_token
 from app.main import app
 from app.models.attendance import Holiday
 from app.models.course import Class, ClassTrainer, Enrollment
+from app.models.email_outbox import EmailOutbox
 from app.models.system_config import SystemConfig
 from app.models.ticket import Ticket, TicketReply
 from app.models.user import Role, User
@@ -301,6 +302,47 @@ def test_student_can_create_open_ticket_and_add_follow_up(
         "Could you show another example?",
     ]
     assert all(reply.user_id == db_session.info["student_id"] for reply in saved.replies)
+
+
+def test_trainer_answer_does_not_queue_an_email_to_the_student(client, db_session):
+    """Ticket reply notifications are delivered in the app only."""
+    created = client.post("/api/tickets", headers=_headers(db_session.info["student_id"]), json={
+        "class_id": str(db_session.info["class_id"]), "question": "Please explain this.",
+    })
+    ticket_id = created.json()["id"]
+    reply = client.post(
+        f"/api/tickets/{ticket_id}/replies",
+        headers=_headers(db_session.info["trainer_id"], "trainer"),
+        json={"message": "Here is the explanation."},
+    )
+    assert reply.status_code == 201
+
+    queued = db_session.query(EmailOutbox).filter(
+        EmailOutbox.to_email == "ticket-student@example.com"
+    ).all()
+    assert queued == []
+
+
+def test_student_unread_reply_is_cleared_by_seen_endpoint(client, db_session):
+    student = _headers(db_session.info["student_id"])
+    trainer = _headers(db_session.info["trainer_id"], "trainer")
+    created = client.post("/api/tickets", headers=student, json={
+        "class_id": str(db_session.info["class_id"]), "question": "Please explain this.",
+    })
+    ticket_id = created.json()["id"]
+    assert client.get("/api/tickets/mine?unread=true", headers=student).json()["total"] == 0
+
+    assert client.post(f"/api/tickets/{ticket_id}/replies", headers=trainer,
+                       json={"message": "Here is the explanation."}).status_code == 201
+    unread = client.get("/api/tickets/mine?unread=true", headers=student).json()
+    assert unread["total"] == 1
+    assert unread["items"][0]["id"] == ticket_id
+
+    assert client.post(f"/api/tickets/{ticket_id}/seen", headers=student).status_code == 204
+    assert client.get("/api/tickets/mine?unread=true", headers=student).json()["total"] == 0
+    assert client.post(f"/api/tickets/{ticket_id}/seen",
+                       headers=_headers(db_session.info["other_student_id"])).status_code == 404
+    assert client.post(f"/api/tickets/{ticket_id}/seen", headers=trainer).status_code == 403
 
 
 def test_trainer_answer_requires_student_confirmation_to_resolve(client, db_session):
@@ -642,7 +684,7 @@ def inbox(db_session):
         ticket = Ticket(id=uuid.UUID(int=index+1), class_id=db_session.info[
             "other_class_id" if index == 3 else "class_id"],
             student_id=db_session.info["student_id"], question=f"Question {index}", status=state,
-            created_at=datetime(2026, 11, 1, tzinfo=UTC) + timedelta(minutes=min(index, 3)))
+            created_at=datetime.now(UTC) - timedelta(hours=2) + timedelta(minutes=min(index, 3)))
         db_session.add(ticket)
         items.append(ticket)
     private_ticket = Ticket(class_id=foreign_class.id, student_id=db_session.info["other_student_id"],
@@ -1090,3 +1132,92 @@ def test_escalation_sla_is_capped_below_ticket_expiration(client, db_session, in
     assert items[str(escalated.id)]["escalated_to_id"] == str(inbox["co_trainer"].id)
     assert items[str(expired.id)]["status"] == "EXPIRED"
     assert items[str(expired.id)]["escalated_to_id"] is None
+
+
+def test_ticket_list_does_not_query_a_user_per_escalated_ticket(client, db_session, inbox):
+    """Regression: escalated_to_name must not lazy-load one user row per ticket."""
+    from sqlalchemy import event
+
+    db_session.query(Ticket).delete()
+    db_session.commit()
+    class_id = db_session.info["class_id"]
+    for index in range(5):
+        db_session.add(
+            Ticket(
+                class_id=class_id,
+                student_id=db_session.info["student_id"],
+                question=f"Escalated {index}",
+                status="OPEN",
+                created_at=datetime.now(UTC) - timedelta(hours=48),
+                escalated_to_id=inbox["co_trainer"].id,
+                escalated_at=datetime.now(UTC) - timedelta(hours=1),
+            )
+        )
+    db_session.commit()
+
+    statements: list[str] = []
+    engine = db_session.get_bind()
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        response = client.get("/api/tickets", headers=_headers(db_session.info["trainer_id"], "trainer"))
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert response.status_code == 200
+    assert len(response.json()["items"]) == 5
+    user_selects = [s for s in statements if s.lstrip().upper().startswith("SELECT USER.")]
+    assert len(user_selects) <= 1, f"expected at most one user SELECT, got {len(user_selects)}"
+
+
+def test_reading_one_ticket_only_sweeps_its_own_class(client, db_session, inbox):
+    """Regression: a single ticket read must not sweep every stale ticket in the DB."""
+    from sqlalchemy import event
+
+    db_session.query(Ticket).delete()
+    db_session.commit()
+    own_class = db_session.info["class_id"]
+    other_class = db_session.info["other_class_id"]
+    own = Ticket(
+        class_id=own_class,
+        student_id=db_session.info["student_id"],
+        question="Own class",
+        status="OPEN",
+        created_at=datetime.now(UTC) - timedelta(hours=48),
+    )
+    db_session.add(own)
+    for index in range(20):
+        db_session.add(
+            Ticket(
+                class_id=other_class,
+                student_id=db_session.info["other_student_id"],
+                question=f"Other class {index}",
+                status="OPEN",
+                created_at=datetime.now(UTC) - timedelta(hours=48),
+            )
+        )
+    db_session.commit()
+
+    statements: list[str] = []
+    engine = db_session.get_bind()
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        response = client.get(
+            f"/api/tickets/{own.id}", headers=_headers(db_session.info["student_id"])
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    assert response.status_code == 200
+    sweep_selects = [s for s in statements if "FROM ticket" in s and "escalated_at IS NULL" in s]
+    assert len(sweep_selects) == 1
+    assert "CLASS_ID IN" in sweep_selects[0].upper()

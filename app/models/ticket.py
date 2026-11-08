@@ -55,14 +55,16 @@ class Ticket(Base):
         Uuid, ForeignKey("user.id", ondelete="SET NULL"), nullable=True, index=True
     )
     escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    student_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     replies: Mapped[list["TicketReply"]] = relationship(
         back_populates="ticket",
         cascade="all, delete-orphan",
         order_by="TicketReply.created_at",
     )
+    # Joined so a ticket list does not issue one SELECT per escalated ticket.
     escalated_to: Mapped[Optional["User"]] = relationship(
-        "User", foreign_keys=[escalated_to_id]
+        "User", foreign_keys=[escalated_to_id], lazy="joined"
     )
 
     @property
