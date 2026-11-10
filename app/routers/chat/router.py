@@ -171,10 +171,11 @@ def open_source(
 
 
 class HighlightRequest(BaseModel):
-    """Passages to mark on one page of a cited PDF."""
+    """Passages to mark on one or more pages of a cited PDF."""
 
     page: int = Field(ge=1)
-    passages: list[str] = Field(default_factory=list, max_length=20)
+    pages: list[int] = Field(default_factory=list)
+    passages: list[str] = Field(default_factory=list, max_length=50)
 
 
 @router.post("/sources/{document_id}/highlight")
@@ -200,11 +201,17 @@ def highlight_source(
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Document file is not available.")
 
-    content = pdf_highlight_service.highlight_pdf(path, payload.page, payload.passages)
+    content, best_page = pdf_highlight_service.highlight_pdf_with_page(
+        path, payload.page, payload.passages, pages=payload.pages
+    )
     return Response(
         content=content,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{record.file_name}"'},
+        headers={
+            "Content-Disposition": f'inline; filename="{record.file_name}"',
+            "Access-Control-Expose-Headers": "X-Target-Page",
+            "X-Target-Page": str(best_page),
+        },
     )
 
 
@@ -231,7 +238,9 @@ def highlight_source_rects(
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Document file is not available.")
 
-    rects = pdf_highlight_service.get_highlight_rects(path, payload.page, payload.passages)
+    rects = pdf_highlight_service.get_highlight_rects(
+        path, payload.page, payload.passages, pages=payload.pages
+    )
     return {"document_id": str(document_id), "page": payload.page, "rects": rects}
 
 

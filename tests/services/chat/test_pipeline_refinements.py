@@ -164,17 +164,17 @@ def test_determine_action_extension():
         is_high_zone=False, is_mid_zone=True, is_low_zone=False, is_hw=False,
     ) == "docs_plus_web"
 
-    # Mid + homework -> docs_socratic
+    # Mid + homework -> docs_plus_web
     assert chat_service._determine_chat_action(
         has_code=False, scope_decision=core_gate, decision_chunks=[_fake_chunk()],
         is_high_zone=False, is_mid_zone=True, is_low_zone=False, is_hw=True,
-    ) == "docs_socratic"
+    ) == "docs_plus_web"
 
-    # Low + homework -> docs_socratic (NEVER web search for homework)
+    # Low + homework -> web_search (search external references when course materials lack code)
     assert chat_service._determine_chat_action(
         has_code=False, scope_decision=core_gate, decision_chunks=[],
         is_high_zone=False, is_mid_zone=False, is_low_zone=True, is_hw=True,
-    ) == "docs_socratic"
+    ) == "web_search"
 
     # Low -> web_search
     assert chat_service._determine_chat_action(
@@ -211,10 +211,18 @@ def test_determine_action_core():
         has_code=False, scope_decision=core_gate, decision_chunks=[],
         is_high_zone=False, is_mid_zone=False, is_low_zone=True, is_hw=False,
     ) == "web_search"
-    # Low with roadmap -> docs (never web search)
+    # Low with roadmap and syllabus question -> docs
     assert chat_service._determine_chat_action(
         has_code=False, scope_decision=core_gate, decision_chunks=[],
         is_high_zone=False, is_mid_zone=False, is_low_zone=True, is_hw=False,
         has_roadmap=True,
+        is_syllabus_q=True,
     ) == "docs"
+    # Low with roadmap but technical question -> web_search to answer the content gap
+    assert chat_service._determine_chat_action(
+        has_code=False, scope_decision=core_gate, decision_chunks=[],
+        is_high_zone=False, is_mid_zone=False, is_low_zone=True, is_hw=False,
+        has_roadmap=True,
+        is_syllabus_q=False,
+    ) == "web_search"
 

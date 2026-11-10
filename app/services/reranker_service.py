@@ -14,8 +14,8 @@ from app.config import settings
 from app.services.ingestion.chunker import build_chunk_context
 from app.services.rag_service import ScoredChunk
 
-RERANK_CANDIDATES = 10
-RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "3"))
+RERANK_CANDIDATES = int(os.getenv("RERANK_CANDIDATES", "15"))
+RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "6"))
 MAX_SEQUENCE_LENGTH = 512
 
 _model_lock = threading.Lock()
@@ -95,6 +95,17 @@ def score_text_pair(text_a: str, text_b: str) -> float:
         return 0.5
 
 
+def _ensure_section_path(metadata: dict[str, Any]) -> None:
+    if not metadata.get("section_path"):
+        headers = [
+            str(metadata.get(f"Header {i}"))
+            for i in range(1, 7)
+            if metadata.get(f"Header {i}")
+        ]
+        if headers:
+            metadata["section_path"] = " > ".join(headers)
+
+
 def rerank_all(
     question: str,
     chunks: list[ScoredChunk],
@@ -103,6 +114,10 @@ def rerank_all(
 
     if not chunks:
         return []
+
+    for chunk in chunks:
+        if isinstance(chunk.metadata, dict):
+            _ensure_section_path(chunk.metadata)
 
     tokenizer, model, device = _load_model()
     import torch

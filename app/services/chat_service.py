@@ -20,10 +20,12 @@ from app.core.prompt_manager import get_prompt_manager
 from app.services import (
     chat_context_service,
     chat_retrieval_service,
+    citation_service,
     course_service,
     decision_service,
     document_service,
     history_service,
+    language_service,
     quick_response_service,
     rag_service,
     suggestion_service,
@@ -35,8 +37,24 @@ logger = logging.getLogger(__name__)
 
 GENERATION_ERROR_MESSAGE = "The answer could not be generated. Please try again."
 TIMEOUT_ERROR_MESSAGE = "The answer timed out. Please try again."
-SUGGESTION_PREFETCH_GRACE_SECONDS = 4.0
+SUGGESTION_PREFETCH_GRACE_SECONDS = 7.0
 SUGGESTION_RETRY_TIMEOUT_SECONDS = 15.0
+
+
+def _is_syllabus_relevant_question(question: str, verdict: str | None = None) -> bool:
+    """Check if the user question is asking about administrative, syllabus, or course logistics."""
+    if verdict == decision_service.ScopeVerdict.LOGISTICS.value:
+        return True
+    q_lower = question.lower()
+    syllabus_keywords = (
+        "syllabus", "roadmap", "lịch trình", "tiến độ", "kế hoạch", "outline",
+        "bao nhiêu buổi", "bao nhiêu unit", "bao nhiêu chương", "bao nhiêu tuần",
+        "how many sessions", "how many units", "how many chapters", "how many weeks",
+        "grading", "điểm số", "tỷ lệ điểm", "trọng số", "thi cuối kỳ", "giữa kỳ",
+        "chuyên cần", "attendance", "learning outcome", "chuẩn đầu ra",
+        "prerequisite", "tiên quyết", "course schedule", "lịch học", "thời khóa biểu",
+    )
+    return any(kw in q_lower for kw in syllabus_keywords)
 
 
 def _format_syllabus_roadmap(
@@ -100,6 +118,9 @@ _HOMEWORK_PATTERNS = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+detect_query_language = language_service.detect_query_language
+_enforce_language = language_service.enforce_language
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -342,6 +363,7 @@ def _determine_chat_action(
     is_hw: bool,
     confidence_threshold: float = 0.8,
     has_roadmap: bool = False,
+    is_syllabus_q: bool = False,
 ) -> str:
     """Resolve the pipeline action based on the refined Truth Table."""
     raw_verdict = scope_decision.verdict if scope_decision else None
@@ -354,14 +376,22 @@ def _determine_chat_action(
     )
 
     if is_hw:
-        return "code_help" if has_code else "docs_socratic"
+        if has_code:
+            return "code_help"
+        # Homework / code exercise request without student code:
+        # Check if course materials actually contain substantive relevant content.
+        if is_high_zone:
+            return "docs_socratic"
+        elif is_mid_zone:
+            return "docs_plus_web"
+        return "web_search"
 
     if has_code:
         # OUT_OF_SCOPE was already rejected beforehand. Code queries route to code_help.
         return "code_help"
     elif gate_low_confidence:
         # Gate error / timeout: fail-safe to avoid unverified web search
-        if is_high_zone or is_mid_zone or has_roadmap:
+        if is_high_zone or is_mid_zone or (is_syllabus_q and has_roadmap):
             return "docs"
         return "safe_fallback"
     elif verdict == decision_service.ScopeVerdict.LOGISTICS.value:
@@ -383,13 +413,20 @@ def _determine_chat_action(
             return "docs"
         elif is_mid_zone:
             return "docs_plus_web"
-        return "docs" if has_roadmap else "web_search"
+        # In the low zone, course materials do not have sufficient information.
+        # Only route to docs if the query is specifically about the syllabus roadmap.
+        # Otherwise, search the web to answer the core technical question and bridge the gap.
+        if is_syllabus_q and has_roadmap:
+            return "docs"
+        return "web_search"
     else:
         if is_high_zone:
             return "docs"
         elif is_mid_zone:
             return "docs_plus_web"
-        return "docs" if has_roadmap else "web_search"
+        if is_syllabus_q and has_roadmap:
+            return "docs"
+        return "web_search"
 
 
 
@@ -724,6 +761,7 @@ async def stream_chat(
 
             roadmap_text, roadmap_chunk = _format_syllabus_roadmap(db, class_id)
             has_roadmap = bool(roadmap_text)
+            is_syllabus_q = _is_syllabus_relevant_question(standalone_question, verdict)
 
             action = _determine_chat_action(
                 has_code=has_code,
@@ -735,6 +773,7 @@ async def stream_chat(
                 is_hw=is_hw,
                 confidence_threshold=settings.decision_confidence_threshold,
                 has_roadmap=has_roadmap,
+                is_syllabus_q=is_syllabus_q,
             )
 
             # Phase 1: Context & Prompt Resolution
@@ -745,9 +784,13 @@ async def stream_chat(
             web_results: list[rag_service.WebResult] = []
 
             if action in ("docs", "docs_socratic"):
-                if decision.chunks:
-                    doc_titles = list(dict.fromkeys(c.title for c in decision.chunks if c.title))
-                    count = len(decision.chunks)
+                substantive_chunks = [
+                    c for c in (decision.chunks or [])
+                    if c.score is not None and c.score >= (decision.unrelated_threshold or 0.40)
+                ]
+                if substantive_chunks:
+                    doc_titles = list(dict.fromkeys(c.title for c in substantive_chunks if c.title))
+                    count = len(substantive_chunks)
                     unit = "section" if count == 1 else "sections"
                     if doc_titles:
                         primary = doc_titles[0]
@@ -761,10 +804,10 @@ async def stream_chat(
                     else:
                         reading_message = f"Found {count} relevant {unit}"
 
-                    slide_chunks = list(decision.chunks)
-                    if roadmap_chunk is not None:
+                    slide_chunks = list(substantive_chunks)
+                    if roadmap_chunk is not None and is_syllabus_q:
                         slide_chunks = [roadmap_chunk] + [
-                            c for c in decision.chunks
+                            c for c in substantive_chunks
                             if c.document_id != roadmap_chunk.document_id
                         ]
                     messages = _format_messages(
@@ -772,7 +815,7 @@ async def stream_chat(
                         context=_with_syllabus(
                             _course_context(slide_chunks),
                             class_description,
-                            syllabus_roadmap=roadmap_text,
+                            syllabus_roadmap=roadmap_text if is_syllabus_q else "",
                         ),
                         question=standalone_question,
                         history=chat_context_service.format_history_context(context_history),
@@ -854,15 +897,18 @@ async def stream_chat(
 
             elif action == "code_help":
                 reading_message = "Analyzing student code"
-                slide_chunks = list(decision.chunks) if decision.chunks else []
-                if not slide_chunks and not is_hw:
+                slide_chunks = [
+                    c for c in (decision.chunks or [])
+                    if c.score is not None and c.score >= (decision.unrelated_threshold or 0.35)
+                ]
+                if not slide_chunks:
                     try:
                         search_q = f"{class_name} C++ pointer reference" if ("ptr" in student_code or "*" in student_code) else f"{class_name} {standalone_question or 'programming syntax reference'}"
                         web_results = await asyncio.to_thread(rag_service.search_internet, search_q)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Web search for code help failed: %s", exc)
                         web_results = []
-                slide_context = _course_context(decision.chunks) if decision.chunks else ""
+                slide_context = _course_context(slide_chunks) if slide_chunks else ""
                 code_block = f"### Student Code / Error Trace:\n```\n{student_code}\n```"
                 full_context = f"{slide_context}\n\n{code_block}" if slide_context else code_block
 
@@ -899,18 +945,25 @@ async def stream_chat(
 
             elif action == "docs_plus_web":
                 web_query = (
-                    scope_decision.external_search_query
-                    if scope_decision and scope_decision.external_search_query
-                    else standalone_question
+                    scope_decision.search_query_en
+                    if (scope_decision and scope_decision.search_query_en)
+                    else (
+                        scope_decision.external_search_query
+                        if (scope_decision and scope_decision.external_search_query)
+                        else rag_service.sanitize_web_query(standalone_question, class_name)
+                    )
                 )
                 yield _progress("searching", f"Searching comparison: {web_query}")
                 web_results = await asyncio.to_thread(rag_service.search_internet, web_query)
 
-                slide_chunks = list(decision.chunks) if decision.chunks else []
+                slide_chunks = [
+                    c for c in (decision.chunks or [])
+                    if c.score is not None and c.score >= (decision.unrelated_threshold or 0.35)
+                ]
                 if not web_results and not slide_chunks:
                     fallback_text = rag_service.NO_SOURCE_MESSAGE
                 else:
-                    slide_context = _course_context(decision.chunks) if decision.chunks else "(No course slides matched)"
+                    slide_context = _course_context(slide_chunks) if slide_chunks else "(No course slides matched)"
                     preview_slide_citations = rag_service.curriculum_citations(slide_chunks) if slide_chunks else []
                     preview_web_citations = (
                         rag_service.internet_citations(web_results, start_index=len(preview_slide_citations) + 1)
@@ -942,7 +995,7 @@ async def stream_chat(
                             "RULES:\n"
                             "1. Synthesis & Depth: Thoroughly explain and compare both sides across essential aspects (such as syntax, compilation/execution model, performance, and practical use cases). "
                             "Synthesize information from the provided Course Materials and External Technology Sources, and integrate standard computer science / programming knowledge to deliver a complete, highly informative answer. "
-                            "Do NOT refuse to answer, do NOT say 'không có thông tin chi tiết', and do NOT output generic disclaimer boilerplates.\n"
+                            "Do NOT refuse to answer, do NOT say information is missing, and do NOT output generic disclaimer boilerplates.\n"
                             "2. Citations & Links: Cite course materials as [1..N] where relevant. For external technology points, cite [N+1..] or mention the technology/source naturally. "
                             "Do NOT output raw URLs, markdown hyperlinks (e.g. [title](url)), or bare lists of links at the end, because sources are already displayed as interactive badges in the user interface.\n"
                             "3. Formatting: Structure clearly with Markdown headings, a side-by-side comparison summary table or bullet points, and code snippets when comparing syntax.\n"
@@ -957,12 +1010,12 @@ async def stream_chat(
 
             elif action == "web_search":
                 web_query = (
-                    scope_decision.external_search_query
-                    if (scope_decision and scope_decision.external_search_query)
+                    scope_decision.search_query_en
+                    if (scope_decision and scope_decision.search_query_en)
                     else (
-                        scope_decision.search_query_en
-                        if (scope_decision and scope_decision.search_query_en)
-                        else standalone_question
+                        scope_decision.external_search_query
+                        if (scope_decision and scope_decision.external_search_query)
+                        else rag_service.sanitize_web_query(standalone_question, class_name)
                     )
                 )
                 is_unverified = gate_low_confidence
@@ -977,17 +1030,22 @@ async def stream_chat(
                     gap_priority,
                     is_unverified,
                 )
-                yield _progress("searching", "Searching the web")
+                search_label = "Searching web for algorithm reference" if is_hw else "Searching the web"
+                yield _progress("searching", search_label)
                 web_results = await asyncio.to_thread(
                     rag_service.search_internet, web_query
                 )
                 if not web_results:
-                    if decision.chunks:
-                        slide_chunks = list(decision.chunks)
+                    substantive = [
+                        c for c in (decision.chunks or [])
+                        if c.score is not None and c.score >= (decision.unrelated_threshold or 0.40)
+                    ]
+                    if substantive:
+                        slide_chunks = list(substantive)
                         reading_message = f"Found {len(slide_chunks)} course sections (web search returned no results)"
                         messages = _format_messages(
                             "answer-course-prompt",
-                            context=_course_context(decision.chunks),
+                            context=_course_context(slide_chunks),
                             question=standalone_question,
                             history=chat_context_service.format_history_context(context_history),
                         )
@@ -1013,8 +1071,20 @@ async def stream_chat(
                     )
                     if is_hw:
                         messages[0] = SystemMessage(
-                            content=str(messages[0].content)
-                            + "\n\nSOCRATIC TUTORING RULE: Guide the student with conceptual hints rather than providing full homework answers."
+                            content=(
+                                "You are an Academic Socratic Tutor for this course.\n"
+                                "The student is asking for help with an exercise, homework, or asking you to write code for an algorithm.\n"
+                                "Since this specific exercise is not in the course materials, guide them using the provided external programming references.\n\n"
+                                "STRICT PEDAGOGICAL / ANTI-CHEATING RULES:\n"
+                                "1. ABSOLUTELY NO COMPLETE CODE: Under NO circumstances should you provide complete, copy-pasteable, runnable solution code (such as a full recursive function or complete main() method). Never write the final solution for the student.\n"
+                                "2. Mathematical & Algorithmic Breakdown: Explain concepts clearly. NEVER use dollar signs ($) or LaTeX math delimiters ($...$ or $$...$$). Write all formulas, equations, and variables as plain text or inline code in backticks (e.g. `F(0) = 0`, `F(1) = 1`, `F(n) = F(n-1) + F(n-2)`).\n"
+                                "3. Socratic Structure:\n"
+                                "   - Base Case: What is the stopping condition to prevent stack overflow or infinite recursion?\n"
+                                "   - Recursive Step: What is the recurrence relation to break the problem into smaller subproblems?\n"
+                                "4. Skeleton with Blanks: Provide pseudocode or a code skeleton with TODO comments only (e.g. `// TODO: implement base case condition here`).\n"
+                                "5. Guiding Questions: Ask 1-2 targeted Socratic questions encouraging the student to think through and complete the implementation.\n"
+                                "6. Language: Always respond in the exact language of the user's question."
+                            )
                         )
 
             else:  # safe_fallback
@@ -1041,7 +1111,7 @@ async def stream_chat(
                     if has_code and student_code
                     else []
                 )
-                chunks_for_suggestions = (
+                base_suggestions_chunks = (
                     slide_chunks
                     if slide_chunks
                     else (
@@ -1057,10 +1127,27 @@ async def stream_chat(
                         else code_fallback_chunks
                     )
                 )
+                if not _is_syllabus_relevant_question(standalone_question, verdict):
+                    filtered_suggestion_chunks = [
+                        c for c in base_suggestions_chunks
+                        if not (c.title and ("syllabus" in c.title.lower() or "roadmap" in c.title.lower()))
+                    ]
+                    chunks_for_suggestions = filtered_suggestion_chunks or base_suggestions_chunks
+                else:
+                    chunks_for_suggestions = base_suggestions_chunks
                 suggestion_question = (
                     f"Explain and debug: {student_code[:120]}"
                     if (not clean_message and has_code and student_code)
                     else standalone_question
+                )
+
+                detected_lang = detect_query_language(clean_message or standalone_question or message)
+                _enforce_language(messages, detected_lang)
+                logger.info(
+                    "Language mandate applied: class=%s detected=%s query='%s'",
+                    class_id,
+                    detected_lang,
+                    (clean_message or standalone_question or message)[:80],
                 )
 
                 stage = f"{action} answer generation"
@@ -1104,11 +1191,23 @@ async def stream_chat(
                 page_citations = rag_service.cited_page_citations(
                     slide_chunks,
                     full_answer,
+                    max_citations=5,
                     question=f"{standalone_question}\n{search_query_en or ''}",
                 )
-                if not page_citations:
-                    page_citations = rag_service.curriculum_citations(slide_chunks)
-                sources.extend(page_citations)
+                if (
+                    not page_citations
+                    and not is_hw
+                    and action not in ("docs_socratic", "code_help")
+                    and is_high_zone
+                ):
+                    high_scoring = [
+                        c for c in slide_chunks
+                        if c.score is not None and c.score >= (decision.threshold or 0.70)
+                    ]
+                    if high_scoring:
+                        page_citations = rag_service.curriculum_citations(high_scoring[:2])
+                if page_citations:
+                    sources.extend(page_citations)
 
             if web_results and full_answer and full_answer != rag_service.NO_SOURCE_MESSAGE:
                 web_citations = rag_service.internet_citations(
@@ -1116,39 +1215,17 @@ async def stream_chat(
                 )
                 used_markers = rag_service.cited_markers(full_answer)
                 matched_web = [s for s in web_citations if s.index in used_markers]
-                sources.extend(matched_web if matched_web else web_citations)
-
-            if not sources and full_answer and full_answer not in (
-                chat_retrieval_service.NO_DOCUMENT_EVIDENCE_MESSAGE,
-                rag_service.NO_SOURCE_MESSAGE,
-            ):
-                if decision.chunks:
-                    sources.extend(rag_service.curriculum_citations(decision.chunks))
-                elif slide_chunks:
-                    sources.extend(rag_service.curriculum_citations(slide_chunks))
-                elif not is_hw and action not in ("docs", "docs_socratic"):
-                    try:
-                        web_ref = await asyncio.to_thread(
-                            rag_service.search_internet, f"{class_name} {standalone_question[:80]}"
+                if not matched_web:
+                    answer_words = citation_service._content_words(full_answer) - citation_service._GENERIC_MATCH_WORDS
+                    substantive_web = [
+                        s for s in web_citations
+                        if bool(
+                            (citation_service._content_words(f"{s.title} {s.snippet or ''}") - citation_service._GENERIC_MATCH_WORDS)
+                            & answer_words
                         )
-                        if web_ref:
-                            sources.extend(rag_service.internet_citations(web_ref[:2]))
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("Web reference search failed: %s", exc)
-                if not sources and class_record is not None:
-                    sources.append(
-                        rag_service.Source(
-                            index=1,
-                            kind=rag_service.SOURCE_CURRICULUM,
-                            title=class_record.name or f"{class_name} Material",
-                            url=None,
-                            snippet=f"Course syllabus and material for {class_name}",
-                            document_id=None,
-                            page=1,
-                            indexes=(1,),
-                            highlights=(),
-                        )
-                    )
+                    ]
+                    matched_web = substantive_web if substantive_web else web_citations[:1]
+                sources.extend(matched_web)
 
             for source in sources:
                 yield _sse("citation", asdict(source))

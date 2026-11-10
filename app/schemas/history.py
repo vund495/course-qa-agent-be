@@ -21,6 +21,8 @@ class ChatCitation(BaseModel):
     snippet: str = ""
     document_id: str | None = None
     page: int | None = None
+    pages: list[int] = Field(default_factory=list)
+    page_label: str | None = None
     indexes: list[int] = Field(default_factory=list)
     highlights: list[str] = Field(default_factory=list)
 

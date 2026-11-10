@@ -157,6 +157,27 @@ def _split_into_sections(markdown: str) -> list[PageSection]:
     return sections
 
 
+def _is_ghost_or_toc_chunk(content: str) -> bool:
+    """Detect and discard table-of-contents dot-leader rows, bare headers, and tiny noise fragments."""
+    clean = content.strip()
+    if not clean:
+        return True
+    # Table of contents lines with dot leaders or Word bookmark errors
+    if re.search(r"\.{5,}|Bookmark not defined", clean, re.IGNORECASE):
+        return True
+    # Preserved code blocks
+    if "```" in clean or "~~~" in clean:
+        return False
+    # Remove markdown header lines (# Header) to inspect substantive body text
+    body = re.sub(r"^#{1,6}\s+.*$", "", clean, flags=re.MULTILINE).strip()
+    words = body.split()
+    # Ghost chunk: less than 4 substantive words and less than 30 characters
+    if len(words) < 4 and len(body) < 30:
+        return True
+    # Standalone running headers or roman numerals like "C++ Tutorial", "viii", "Page 2"
+    return bool(len(words) <= 3 and re.fullmatch(r"[ivxlcdm\d\s\-_.,:]+", body, re.IGNORECASE))
+
+
 def _apply_locator(
     metadata: dict[str, Any],
     section: PageSection,
@@ -233,7 +254,7 @@ def markdown_chunker(
             _apply_locator(meta, section, ordered_keys, default_label)
 
             chunk.page_content = chunk.page_content.strip()
-            if chunk.page_content:
+            if chunk.page_content and not _is_ghost_or_toc_chunk(chunk.page_content):
                 output_chunks.append(chunk)
 
         if page_chunks:
@@ -351,16 +372,25 @@ def recursive_chunker(
     for doc in documents:
         raw_chunks.extend(_split_chunk(doc, splitter, size))
 
+    filtered_chunks = [c for c in raw_chunks if not _is_ghost_or_toc_chunk(c.page_content)]
     if metadata:
-        for chunk in raw_chunks:
+        for chunk in filtered_chunks:
             chunk.metadata.update(metadata)
-    return raw_chunks
+    return filtered_chunks
 
 
 def build_chunk_context(content: str, metadata: Mapping[str, Any]) -> str:
     """Add retrieval context without changing the source used for citations."""
     parts: list[str] = []
     section_path = metadata.get("section_path")
+    if not section_path:
+        headers = [
+            str(metadata.get(f"Header {i}"))
+            for i in range(1, 7)
+            if metadata.get(f"Header {i}")
+        ]
+        if headers:
+            section_path = " > ".join(headers)
     if section_path:
         parts.append(f"Section: {section_path}")
     table_header = metadata.get("table_header")
