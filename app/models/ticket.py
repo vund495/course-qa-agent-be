@@ -10,6 +10,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 if TYPE_CHECKING:
+    from app.models.attendance import TicketHandover
     from app.models.user import User
 
 
@@ -56,6 +57,12 @@ class Ticket(Base):
     )
     escalated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     student_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    owner_trainer_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("user.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    queued_for_admin_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
 
     replies: Mapped[list["TicketReply"]] = relationship(
         back_populates="ticket",
@@ -66,10 +73,49 @@ class Ticket(Base):
     escalated_to: Mapped[Optional["User"]] = relationship(
         "User", foreign_keys=[escalated_to_id], lazy="joined"
     )
+    owner: Mapped[Optional["User"]] = relationship(
+        "User", foreign_keys=[owner_trainer_id], lazy="joined"
+    )
+    handovers: Mapped[list["TicketHandover"]] = relationship(
+        "TicketHandover",
+        back_populates="ticket",
+        order_by="TicketHandover.created_at.desc()",
+        lazy="selectin",
+    )
 
     @property
     def escalated_to_name(self) -> str | None:
         return self.escalated_to.full_name if self.escalated_to is not None else None
+
+    @property
+    def owner_trainer_name(self) -> str | None:
+        return self.owner.full_name if self.owner is not None else None
+
+    def _latest_accepted_handover(self) -> Optional["TicketHandover"]:
+        for handover in self.handovers:
+            if handover.status == "accepted":
+                return handover
+        return None
+
+    @property
+    def handover_from_id(self) -> uuid.UUID | None:
+        handover = self._latest_accepted_handover()
+        return handover.from_trainer_id if handover is not None else None
+
+    @property
+    def handover_from_name(self) -> str | None:
+        handover = self._latest_accepted_handover()
+        return handover.from_trainer_name if handover is not None else None
+
+    @property
+    def handover_reason(self) -> str | None:
+        handover = self._latest_accepted_handover()
+        return handover.reason if handover is not None else None
+
+    @property
+    def handover_at(self) -> datetime | None:
+        handover = self._latest_accepted_handover()
+        return handover.created_at if handover is not None else None
 
 
 class TicketReply(Base):

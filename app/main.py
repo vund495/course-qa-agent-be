@@ -29,6 +29,7 @@ from app.routers.citations.router import router as citations_router
 from app.routers.class_config import router as class_config_router
 from app.routers.content_gaps import router as content_gaps_router
 from app.routers.documents import router as documents_router
+from app.routers.handover import router as handover_router
 from app.routers.history import router as history_router
 from app.routers.question_bank import router as question_bank_router
 from app.routers.quizzes import router as quizzes_router
@@ -147,6 +148,7 @@ app.include_router(categories_router)
 app.include_router(content_gaps_router)
 app.include_router(attendance_router)
 app.include_router(attendance_student_router)
+app.include_router(handover_router)
 
 
 

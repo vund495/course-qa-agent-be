@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
 from app.models.user import User
+from app.schemas.handover import HandoverAssignRequest, HandoverRead
 from app.schemas.tickets import (
     TicketCountsResponse,
     TicketCreate,
@@ -17,15 +18,25 @@ from app.schemas.tickets import (
     TicketStatus,
     TicketThreadRead,
 )
-from app.services import ticket_service
+from app.services import course_service, handover_service, ticket_service
+from app.services.course_service import DomainError
 from app.services.user_service import role_name_of
 
 router = APIRouter(prefix="/api/tickets", tags=["tickets"])
 
 
+def _role(user: User) -> str:
+    return (role_name_of(user) or "").upper()
+
+
 def _require_student(user: User) -> None:
-    if role_name_of(user) != "STUDENT":
+    if _role(user) != "STUDENT":
         raise HTTPException(status_code=403, detail="Only students can create or update tickets.")
+
+
+def _require_admin(user: User) -> None:
+    if _role(user) != "ADMIN":
+        raise HTTPException(status_code=403, detail="Only admins can do this.")
 
 
 @router.get("", response_model=TicketListResponse)
@@ -37,7 +48,18 @@ def list_tickets(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> TicketListResponse:
-    if role_name_of(user) != "TRAINER":
+    role = _role(user)
+    if role == "ADMIN":
+        items = ticket_service.list_admin_queue(db)
+        total = len(items)
+        start = (page - 1) * page_size
+        return TicketListResponse(
+            items=items[start : start + page_size],
+            total=total,
+            page=page,
+            page_size=page_size,
+        )
+    if role != "TRAINER":
         raise HTTPException(status_code=403, detail="Only trainers can view the ticket inbox.")
     try:
         items, total = ticket_service.list_trainer_tickets(
@@ -134,8 +156,14 @@ def get_ticket(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> TicketThreadRead:
-    _require_student(user)
-    ticket = ticket_service.get_student_ticket(db, ticket_id=ticket_id, student_id=user.id)
+    role = _role(user)
+    if role == "ADMIN":
+        ticket = ticket_service.get_admin_ticket(db, ticket_id)
+    else:
+        _require_student(user)
+        ticket = ticket_service.get_student_ticket(
+            db, ticket_id=ticket_id, student_id=user.id
+        )
     if ticket is None:
         raise HTTPException(status_code=404, detail="Ticket not found.")
     return TicketThreadRead.model_validate(ticket)
@@ -148,7 +176,17 @@ def resolve_ticket(
     user: User = Depends(get_current_user),
 ) -> TicketRead:
     """AC-01: the student confirms, or the assigned trainer marks it handled."""
-    role = role_name_of(user)
+    role = _role(user)
+    if role == "ADMIN":
+        existing = ticket_service.get_admin_ticket(db, ticket_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Ticket not found.")
+        ticket = ticket_service.resolve_admin_ticket(db, ticket_id=ticket_id)
+        if ticket is None:
+            raise HTTPException(
+                status_code=409, detail="Only an open or answered ticket can be resolved."
+            )
+        return TicketRead.model_validate(ticket)
     if role == "TRAINER":
         try:
             existing = ticket_service.get_trainer_ticket(
@@ -186,8 +224,10 @@ def reopen_ticket(
     user: User = Depends(get_current_user),
 ) -> TicketRead:
     """AC-02: reopen a resolved ticket back to Answered, or Open without a reply."""
-    role = role_name_of(user)
-    if role == "TRAINER":
+    role = _role(user)
+    if role == "ADMIN":
+        existing = ticket_service.get_admin_ticket(db, ticket_id)
+    elif role == "TRAINER":
         try:
             existing = ticket_service.get_trainer_ticket(
                 db, ticket_id=ticket_id, trainer_id=user.id
@@ -217,8 +257,14 @@ def add_ticket_reply(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> TicketReplyRead:
-    role = role_name_of(user)
-    if role == "STUDENT":
+    role = _role(user)
+    if role == "ADMIN":
+        reply = ticket_service.add_admin_reply(
+            db, ticket_id=ticket_id, admin_id=user.id, message=payload.message,
+        )
+        if reply is None:
+            raise HTTPException(status_code=409, detail="Only open tickets can be answered.")
+    elif role == "STUDENT":
         existing = ticket_service.get_student_ticket(db, ticket_id=ticket_id, student_id=user.id)
         if existing is None:
             raise HTTPException(status_code=404, detail="Ticket not found.")
@@ -244,3 +290,43 @@ def add_ticket_reply(
     if reply is None:
         raise HTTPException(status_code=409, detail="Only open tickets can receive follow-up messages.")
     return TicketReplyRead.model_validate(reply)
+
+
+@router.post("/{ticket_id}/handover", response_model=HandoverRead)
+def assign_ticket(
+    ticket_id: uuid.UUID,
+    payload: HandoverAssignRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> HandoverRead:
+    """Admin-only manual transfer within the ticket's class (Phase 4)."""
+    _require_admin(user)
+    ticket = ticket_service.get_admin_ticket(db, ticket_id)
+    if ticket is None:
+        raise HTTPException(status_code=404, detail="Ticket not found.")
+
+    target = db.query(User).filter(User.id == payload.to_trainer_id).first()
+    if target is None:
+        raise HTTPException(status_code=404, detail="Trainer not found.")
+    class_trainer_ids = {
+        item["trainer_id"]
+        for item in course_service.list_trainers(db, ticket.class_id)
+    }
+    if target.id not in class_trainer_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Target trainer does not teach this class.",
+        )
+
+    try:
+        handover = handover_service.assign(
+            db,
+            ticket,
+            target,
+            "manual_transfer",
+            user.id,
+            status="accepted",
+        )
+    except DomainError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return HandoverRead.model_validate(handover)

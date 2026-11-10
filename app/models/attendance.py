@@ -7,6 +7,7 @@ with AI-136/AI-157; this module owns only the schema contract.
 
 import datetime as dt
 import uuid
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     CheckConstraint,
@@ -23,16 +24,22 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+
+if TYPE_CHECKING:
+    from app.models.ticket import Ticket
+    from app.models.user import User
 
 ATTENDANCE_STATUSES = ("present", "excused_absence", "unexcused_absence", "late")
 HANDOVER_REASONS = ("auto_absent", "manual_transfer")
 HANDOVER_STATUSES = ("pending", "accepted", "rejected")
 HOLIDAY_SCOPES = ("system", "class")
 HOLIDAY_TYPES = ("solar", "lunar", "admin")
+LEAVE_REQUEST_STATUSES = ("pending", "accepted", "rejected")
 SESSION_STATUSES = ("scheduled", "cancelled", "rescheduled")
+TRAINER_DAY_STATUSES = ("present", "off")
 
 _STUDENT_ONLY = text("student_id IS NOT NULL")
 _TRAINER_ONLY = text("trainer_id IS NOT NULL")
@@ -170,6 +177,90 @@ class Attendance(Base):
     )
 
 
+class TrainerDayStatus(Base):
+    """Teacher availability for one calendar day (AI-158)."""
+
+    __tablename__ = "trainer_day_status"
+    __table_args__ = (
+        CheckConstraint("status IN ('present', 'off')", name="ck_trainer_day_status_status"),
+        UniqueConstraint("trainer_id", "date", name="uq_trainer_day_status_trainer_date"),
+        Index("ix_trainer_day_status_date_status", "date", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    trainer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("user.id", ondelete="CASCADE"), nullable=False
+    )
+    date: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recorded_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class LeaveRequest(Base):
+    """A teacher's planned absence and the colleague who should cover it (AI-158)."""
+
+    __tablename__ = "leave_request"
+    __table_args__ = (
+        CheckConstraint("date_to >= date_from", name="ck_leave_request_dates"),
+        CheckConstraint(
+            "status IN ('pending', 'accepted', 'rejected')",
+            name="ck_leave_request_status",
+        ),
+        CheckConstraint(
+            "trainer_id <> target_trainer_id",
+            name="ck_leave_request_same_trainer",
+        ),
+        Index("ix_leave_request_trainer_status", "trainer_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    trainer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("user.id", ondelete="CASCADE"), nullable=False
+    )
+    date_from: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    date_to: Mapped[dt.date] = mapped_column(Date, nullable=False)
+    target_trainer_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("user.id", ondelete="RESTRICT"), nullable=False
+    )
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="pending"
+    )
+    responded_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    responded_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    trainer: Mapped["User"] = relationship(
+        "User", foreign_keys=[trainer_id], lazy="joined"
+    )
+    target_trainer: Mapped["User"] = relationship(
+        "User", foreign_keys=[target_trainer_id], lazy="joined"
+    )
+
+    @property
+    def trainer_name(self) -> str | None:
+        return self.trainer.full_name if self.trainer is not None else None
+
+    @property
+    def target_trainer_name(self) -> str | None:
+        return self.target_trainer.full_name if self.target_trainer is not None else None
+
+
 class Holiday(Base):
     """System-wide or per-class day off, matched by date only."""
 
@@ -255,3 +346,25 @@ class TicketHandover(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     responded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    ticket: Mapped["Ticket"] = relationship(
+        "Ticket", foreign_keys=[ticket_id], back_populates="handovers", lazy="joined"
+    )
+    from_trainer: Mapped["User"] = relationship(
+        "User", foreign_keys=[from_trainer_id], lazy="joined"
+    )
+    to_trainer: Mapped["User"] = relationship(
+        "User", foreign_keys=[to_trainer_id], lazy="joined"
+    )
+
+    @property
+    def ticket_question(self) -> str | None:
+        return self.ticket.question if self.ticket is not None else None
+
+    @property
+    def from_trainer_name(self) -> str | None:
+        return self.from_trainer.full_name if self.from_trainer is not None else None
+
+    @property
+    def to_trainer_name(self) -> str | None:
+        return self.to_trainer.full_name if self.to_trainer is not None else None
