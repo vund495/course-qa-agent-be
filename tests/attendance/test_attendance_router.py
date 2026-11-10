@@ -26,7 +26,7 @@ from app.core.database import Base, get_session_local, reset_engine
 from app.core.deps import get_db
 from app.core.security import create_access_token
 from app.main import app
-from app.models.attendance import ClassSession
+from app.models.attendance import ClassSession, Holiday
 from app.models.course import Class, ClassTrainer, Enrollment
 from app.models.user import Role, User
 from app.services.holiday_service import VIETNAM_TZ
@@ -194,8 +194,9 @@ def test_endpoints_require_authentication(client: TestClient, db_session: Sessio
     )
     assert client.get(f"/api/classes/{class_id}/attendance/summary").status_code == 401
 
-    # Student Attendance History
+    # Student Attendance History & Schedule
     assert client.get(f"/api/student/classes/{class_id}/attendance").status_code == 401
+    assert client.get(f"/api/student/classes/{class_id}/schedule").status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -836,5 +837,117 @@ def test_student_attendance_history_endpoint(client: TestClient, db_session: Ses
         headers=admin_hdr,
     )
     assert res_admin.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# 11. Student Schedule (AI-157)
+# ---------------------------------------------------------------------------
+
+
+def test_student_schedule_endpoint(client: TestClient, db_session: Session):
+    class_id = db_session.info["class_id"]
+    primary_hdr = _headers(db_session.info["primary_trainer_id"], "trainer")
+    student_hdr = _headers(db_session.info["enrolled_student_id"], "student")
+    other_student_hdr = _headers(db_session.info["other_student_id"], "student")
+    admin_hdr = _headers(db_session.info["admin_id"], "admin")
+
+    today = datetime.now(VIETNAM_TZ).date()
+    past_date = today - timedelta(days=2)
+    future_date = today + timedelta(days=3)
+
+    past = _make_session_helper(
+        db_session, class_id, past_date, db_session.info["primary_trainer_id"]
+    )
+    future = _make_session_helper(
+        db_session, class_id, future_date, db_session.info["primary_trainer_id"]
+    )
+
+    # Mark the past session for the enrolled student only.
+    mark_res = client.put(
+        f"/api/classes/{class_id}/sessions/{past.id}/attendance",
+        json={
+            "records": [
+                {
+                    "student_id": str(db_session.info["enrolled_student_id"]),
+                    "status": "present",
+                    "note": "Attended lecture",
+                }
+            ]
+        },
+        headers=primary_hdr,
+    )
+    assert mark_res.status_code == 200
+
+    holiday_date = today + timedelta(days=1)
+    db_session.add(
+        Holiday(
+            date=holiday_date,
+            name="Test holiday",
+            type="admin",
+            scope="system",
+        )
+    )
+    db_session.commit()
+
+    res = client.get(
+        f"/api/student/classes/{class_id}/schedule?from={past_date}&to={future_date}",
+        headers=student_hdr,
+    )
+    assert res.status_code == 200
+    data = res.json()
+
+    assert data["class_id"] == str(class_id)
+    assert data["class_code"] == "CS101-FA26-001"
+    assert data["class_name"] == "Computer Science 101"
+    assert data["date_from"] == str(past_date)
+    assert data["date_to"] == str(future_date)
+    assert data["today"] == str(today)
+
+    sessions = data["sessions"]
+    assert [s["id"] for s in sessions] == [str(past.id), str(future.id)]
+    assert sessions[0]["subject"] == "Computer Science 101"
+    assert sessions[0]["trainer_name"] == "Primary Trainer"
+    assert sessions[0]["attendance_status"] == "present"
+    assert sessions[0]["attendance_note"] == "Attended lecture"
+    assert sessions[1]["attendance_status"] is None
+
+    assert data["holidays"] == [
+        {
+            "date": str(holiday_date),
+            "name": "Test holiday",
+            "type": "admin",
+            "scope": "system",
+        }
+    ]
+
+    # Only enrolled students can use the student schedule endpoint.
+    assert (
+        client.get(
+            f"/api/student/classes/{class_id}/schedule",
+            headers=other_student_hdr,
+        ).status_code
+        == 403
+    )
+    assert (
+        client.get(
+            f"/api/student/classes/{class_id}/schedule",
+            headers=primary_hdr,
+        ).status_code
+        == 403
+    )
+    assert (
+        client.get(
+            f"/api/student/classes/{class_id}/schedule",
+            headers=admin_hdr,
+        ).status_code
+        == 403
+    )
+
+    # Invalid range is a 400, not a 500.
+    bad_range = client.get(
+        f"/api/student/classes/{class_id}/schedule?from={future_date}&to={past_date}",
+        headers=student_hdr,
+    )
+    assert bad_range.status_code == 400
 
 
