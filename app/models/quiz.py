@@ -18,6 +18,7 @@ from sqlalchemy import (
     Uuid,
     func,
     text,
+    true,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -86,6 +87,9 @@ class Quiz(Base):
     closes_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     max_attempts: Mapped[int | None] = mapped_column(
         Integer, nullable=True, default=1, server_default="1"
+    )
+    show_solutions_after_submission: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
     )
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="DRAFT", server_default="DRAFT"
@@ -156,6 +160,8 @@ class QuizQuestion(Base):
     rubric: Mapped[str | None] = mapped_column(Text, nullable=True)
     source_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
     grading_config: Mapped[dict | None] = mapped_column(JSON_TYPE, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    validation_flags: Mapped[list[str] | None] = mapped_column(JSON_TYPE, nullable=True)
 
     quiz: Mapped[Quiz] = relationship(back_populates="questions")
     skill: Mapped["Skill"] = relationship("Skill", back_populates="questions")
