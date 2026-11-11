@@ -158,7 +158,7 @@ def _split_into_sections(markdown: str) -> list[PageSection]:
 
 
 def _is_ghost_or_toc_chunk(content: str) -> bool:
-    """Detect and discard table-of-contents dot-leader rows, bare headers, and tiny noise fragments."""
+    """Detect and discard table-of-contents dot-leader rows and bare headers without body."""
     clean = content.strip()
     if not clean:
         return True
@@ -168,14 +168,9 @@ def _is_ghost_or_toc_chunk(content: str) -> bool:
     # Preserved code blocks
     if "```" in clean or "~~~" in clean:
         return False
-    # Remove markdown header lines (# Header) to inspect substantive body text
+    # Drop chunks that are purely headers with no body text
     body = re.sub(r"^#{1,6}\s+.*$", "", clean, flags=re.MULTILINE).strip()
-    words = body.split()
-    # Ghost chunk: less than 4 substantive words and less than 30 characters
-    if len(words) < 4 and len(body) < 30:
-        return True
-    # Standalone running headers or roman numerals like "C++ Tutorial", "viii", "Page 2"
-    return bool(len(words) <= 3 and re.fullmatch(r"[ivxlcdm\d\s\-_.,:]+", body, re.IGNORECASE))
+    return not body
 
 
 def _apply_locator(
@@ -372,11 +367,10 @@ def recursive_chunker(
     for doc in documents:
         raw_chunks.extend(_split_chunk(doc, splitter, size))
 
-    filtered_chunks = [c for c in raw_chunks if not _is_ghost_or_toc_chunk(c.page_content)]
     if metadata:
-        for chunk in filtered_chunks:
+        for chunk in raw_chunks:
             chunk.metadata.update(metadata)
-    return filtered_chunks
+    return raw_chunks
 
 
 def build_chunk_context(content: str, metadata: Mapping[str, Any]) -> str:

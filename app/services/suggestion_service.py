@@ -120,6 +120,17 @@ def build_fallback_followups(
     q_lower = question.lower()
     topic = _extract_clean_topic(question) or class_name or ("chủ đề này" if is_vi else "this topic")
 
+    # Check if chunks have titles or topic keywords
+    for chunk in chunks[:3]:
+        title = (chunk.title or "").replace(".pdf", "").replace(".docx", "").strip()
+        if title and title.lower() not in {"course material", "unknown"}:
+            if is_vi:
+                results.append(f"Bạn có thể giải thích thêm về nội dung trong phần '{title}' không?")
+            else:
+                results.append(f"Could you explain more about the contents in '{title}'?")
+            if len(results) >= 2:
+                break
+
     if is_vi:
         if any(kw in q_lower for kw in ("hello world", "chương trình đầu", "first program", "bắt đầu c++")):
             results.append("Hàm main() đóng vai trò là điểm bắt đầu thực thi chương trình như thế nào?")

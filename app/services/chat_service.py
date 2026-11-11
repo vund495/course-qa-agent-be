@@ -130,6 +130,19 @@ def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+def _citation_dict(source: rag_service.Source) -> dict[str, Any]:
+    """Serialize a Source object while omitting redundant single-page metadata for contract compatibility."""
+    d = asdict(source)
+    pages = d.get("pages")
+    page = d.get("page")
+    page_label = d.get("page_label")
+    if not pages or (page is not None and list(pages) == [page]):
+        d.pop("pages", None)
+    if not page_label or (page is not None and page_label == str(page)):
+        d.pop("page_label", None)
+    return d
+
+
 def _chunk_text(content: Any) -> str:
     """Extract displayable text from a LangChain message chunk."""
 
@@ -378,13 +391,11 @@ def _determine_chat_action(
     if is_hw:
         if has_code:
             return "code_help"
-        # Homework / code exercise request without student code:
-        # Check if course materials actually contain substantive relevant content.
-        if is_high_zone:
-            return "docs_socratic"
-        elif is_mid_zone:
+        if is_mid_zone:
             return "docs_plus_web"
-        return "web_search"
+        if is_low_zone and not decision_chunks:
+            return "web_search"
+        return "docs_socratic"
 
     if has_code:
         # OUT_OF_SCOPE was already rejected beforehand. Code queries route to code_help.
@@ -950,7 +961,7 @@ async def stream_chat(
                     else (
                         scope_decision.external_search_query
                         if (scope_decision and scope_decision.external_search_query)
-                        else rag_service.sanitize_web_query(standalone_question, class_name)
+                        else standalone_question
                     )
                 )
                 yield _progress("searching", f"Searching comparison: {web_query}")
@@ -1015,7 +1026,7 @@ async def stream_chat(
                     else (
                         scope_decision.external_search_query
                         if (scope_decision and scope_decision.external_search_query)
-                        else rag_service.sanitize_web_query(standalone_question, class_name)
+                        else standalone_question
                     )
                 )
                 is_unverified = gate_low_confidence
@@ -1228,7 +1239,7 @@ async def stream_chat(
                 sources.extend(matched_web)
 
             for source in sources:
-                yield _sse("citation", asdict(source))
+                yield _sse("citation", _citation_dict(source))
 
             # Await suggestions before sending done event
             if suggestion_task is not None:
@@ -1256,7 +1267,7 @@ async def stream_chat(
             if followup_questions:
                 yield _sse("suggestions", {"questions": followup_questions})
 
-            citation_payload = [asdict(source) for source in sources]
+            citation_payload = [_citation_dict(source) for source in sources]
             used_web = action in ("web_search", "docs_plus_web") or decision.source == rag_service.SOURCE_INTERNET
 
             fallback_reason: str | None = None
