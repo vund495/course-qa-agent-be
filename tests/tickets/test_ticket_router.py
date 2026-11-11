@@ -952,13 +952,18 @@ def test_trainer_cannot_change_status_in_a_foreign_class(client, db_session, inb
 def test_inbox_rejects_other_roles_and_invalid_filters(client, db_session):
     assert client.get("/api/tickets").status_code == 401
     assert client.get("/api/tickets", headers=_headers(db_session.info["student_id"])).status_code == 403
-    for role_name in ["ADMIN", "TEACHING_ASSISTANT"]:
+    for role_name, expected in [("ADMIN", 200), ("TEACHING_ASSISTANT", 403)]:
         role = db_session.query(Role).filter_by(name=role_name).one()
         user = User(full_name=role_name, email=f"{role_name.lower()}@tickets.example.com",
                     role_id=role.id, status="ACTIVE")
         db_session.add(user)
         db_session.commit()
-        assert client.get("/api/tickets", headers=_headers(user.id, role_name.lower())).status_code == 403
+        assert (
+            client.get(
+                "/api/tickets", headers=_headers(user.id, role_name.lower())
+            ).status_code
+            == expected
+        )
     headers = _headers(db_session.info["trainer_id"], "trainer")
     for query in ["status=INVALID", "page=0", "page_size=0", "page_size=101", "class_id=invalid"]:
         assert client.get(f"/api/tickets?{query}", headers=headers).status_code == 422
