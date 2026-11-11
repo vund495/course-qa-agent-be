@@ -15,8 +15,8 @@ class-scope-prompt:
     - reasoning: Briefly explain your reasoning in 1 sentence before setting the verdict.
     - is_related_tech: Only when verdict is out_of_scope. True if it asks about another programming language/tech, False if it is a general non-tech topic.
     - is_homework_request: True if the student explicitly asks to solve their homework/assignment/exam to copy code.
-    - external_search_query: When verdict is comparison or extension, provide a clean search query isolating the external or extension topic (e.g., "Python garbage collection" or "CMake configuration VS Code"). Otherwise null.
-    - search_query_en: When the student's question is not in English, provide an equivalent English technical search query (e.g. "Is C++ case-sensitive?" for "C++ có phân biệt chữ hoa chữ thường không?"). Otherwise null.
+    - external_search_query: A concise 2-4 word search engine query leading with the primary technical subject (e.g. "quicksort pivot algorithm", "C++ Fibonacci recursion", "C++ smart pointers"). NEVER output long diluted phrases or conversational sentences.
+    - search_query_en: A concise English 2-4 word technical keyword query leading with the subject noun (e.g. "quicksort pivot algorithm", "C++ Fibonacci recursion"). Keep it short and specific to avoid query dilution.
     - confidence: Confidence score between 0.0 and 1.0.
 
     Return only valid JSON matching the ScopeDecision schema.

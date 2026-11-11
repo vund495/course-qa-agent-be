@@ -56,9 +56,12 @@ def _compute_page_rects(
     if not passages:
         return []
 
-    words = page.get_text("words", sort=True)  # (x0, y0, x1, y1, text, block, line, n)
-    if not words:
+    raw_words = page.get_text("words", sort=False)  # (x0, y0, x1, y1, text, block, line, n)
+    if not raw_words:
         return []
+
+    # Preserve natural layout reading order (columns and blocks are ordered by block_no, line_no, word_no)
+    words = sorted(raw_words, key=lambda w: (w[5], w[6], w[7]))
 
     variants: list[tuple[list[str], list[tuple[int, ...]]]] = []
     for dehyphenate in (False, True):
@@ -88,7 +91,19 @@ def _compute_page_rects(
         variants.append((tokens, spans))
 
     selected_words: set[int] = set()
+    expanded_passages: list[str] = []
     for passage in passages:
+        expanded_passages.append(passage)
+        # If passage contains bullet points or separate lines, decompose as fallbacks
+        items = [
+            part.strip()
+            for part in re.split(r"(?m)(?=^[ \t]*[-*+]|\d+[.)])|\n\n+", passage)
+            if part.strip()
+        ]
+        if len(items) > 1:
+            expanded_passages.extend(items)
+
+    for passage in expanded_passages:
         expected = _tokens(passage)
         if not expected:
             continue
@@ -105,8 +120,9 @@ def _compute_page_rects(
                     matches.add(tuple(sorted({
                         index for span in spans[start:end] for index in span
                     })))
-        if len(matches) == 1:
-            selected_words.update(next(iter(matches)))
+        if matches:
+            for match in matches:
+                selected_words.update(match)
     return [pymupdf.Rect(words[index][:4]) for index in sorted(selected_words)]
 
 
@@ -114,33 +130,77 @@ def get_highlight_rects(
     path: Path,
     page_number: int,
     passages: Sequence[str],
+    pages: Sequence[int] | None = None,
 ) -> list[dict[str, float]]:
     """Return lightweight bounding boxes [{x0, y0, x1, y1}] without re-rendering entire PDF bytes."""
     doc = pymupdf.open(path)
     try:
-        if 1 <= page_number <= doc.page_count:
-            page = doc[page_number - 1]
-            rects = _compute_page_rects(page, passages)
-            return [
-                {"x0": round(r.x0, 2), "y0": round(r.y0, 2), "x1": round(r.x1, 2), "y1": round(r.y1, 2)}
-                for r in rects
+        explicit_pages = [p for p in (pages or []) if 1 <= p <= doc.page_count]
+        if explicit_pages:
+            candidate_pages = list(dict.fromkeys(
+                explicit_pages + [p + d for p in explicit_pages for d in (1, -1)]
+            ))
+        else:
+            candidate_pages = [page_number] + [
+                page_number + d for d in (1, -1, 2, -2) if 1 <= page_number + d <= doc.page_count
             ]
+        seen_pages: set[int] = set()
+        for p_num in candidate_pages:
+            if 1 <= p_num <= doc.page_count and p_num not in seen_pages:
+                seen_pages.add(p_num)
+                page = doc[p_num - 1]
+                rects = _compute_page_rects(page, passages)
+                if rects:
+                    return [
+                        {"x0": round(r.x0, 2), "y0": round(r.y0, 2), "x1": round(r.x1, 2), "y1": round(r.y1, 2)}
+                        for r in rects
+                    ]
         return []
     finally:
         doc.close()
 
 
-def highlight_pdf(path: Path, page_number: int, passages: Sequence[str]) -> bytes:
-    """Return the PDF with the cited passages highlighted on ``page_number``."""
+def highlight_pdf_with_page(
+    path: Path,
+    page_number: int,
+    passages: Sequence[str],
+    pages: Sequence[int] | None = None,
+) -> tuple[bytes, int]:
+    """Return the PDF with the cited passages highlighted, plus the page number with the most highlights."""
     doc = pymupdf.open(path)
     try:
-        if 1 <= page_number <= doc.page_count:
-            page = doc[page_number - 1]
-            rects = _compute_page_rects(page, passages)
-            if rects:
-                annotation = page.add_highlight_annot(quads=[rect.quad for rect in rects])
-                annotation.set_colors(stroke=(1, 0.85, 0.2))
-                annotation.update()
-        return doc.tobytes(garbage=3, deflate=True)
+        explicit_pages = [p for p in (pages or []) if 1 <= p <= doc.page_count]
+        if explicit_pages:
+            candidate_pages = list(dict.fromkeys(
+                explicit_pages + [p + d for p in explicit_pages for d in (1, -1)]
+            ))
+        else:
+            candidate_pages = [page_number] + [
+                page_number + d for d in (1, -1, 2, -2) if 1 <= page_number + d <= doc.page_count
+            ]
+        seen_pages: set[int] = set()
+        page_rect_counts: dict[int, int] = {}
+        for p_num in candidate_pages:
+            if 1 <= p_num <= doc.page_count and p_num not in seen_pages:
+                seen_pages.add(p_num)
+                page = doc[p_num - 1]
+                rects = _compute_page_rects(page, passages)
+                if rects:
+                    page_rect_counts[p_num] = len(rects)
+                    annotation = page.add_highlight_annot(quads=[rect.quad for rect in rects])
+                    annotation.set_colors(stroke=(1, 0.85, 0.2))
+                    annotation.update()
+        if page_rect_counts:
+            forward_pages = [p for p in page_rect_counts if p >= page_number]
+            best_page = min(forward_pages) if forward_pages else min(page_rect_counts, key=lambda p: abs(p - page_number))
+        else:
+            best_page = page_number
+        return doc.tobytes(garbage=3, deflate=True), best_page
     finally:
         doc.close()
+
+
+def highlight_pdf(path: Path, page_number: int, passages: Sequence[str], pages: Sequence[int] | None = None) -> bytes:
+    """Return the PDF with the cited passages highlighted on ``page_number`` and adjacent pages."""
+    content, _ = highlight_pdf_with_page(path, page_number, passages, pages=pages)
+    return content

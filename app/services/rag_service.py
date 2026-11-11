@@ -16,6 +16,7 @@ owns the routing decision and the source contract.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import math
 import re
@@ -142,6 +143,8 @@ class Source:
     snippet: str = ""
     document_id: str | None = None
     page: int | None = None
+    pages: tuple[int, ...] = ()
+    page_label: str | None = None
     # Answer markers ([n]) this page backs, and the exact passages used.
     indexes: tuple[int, ...] = ()
     highlights: tuple[str, ...] = ()
@@ -479,11 +482,195 @@ def _serpapi_web_results(
     return web_results
 
 
-def search_internet(question: str) -> list[WebResult]:
+def sanitize_web_query(query: str, class_name: str = "") -> str:
+    """Transform conversational student questions into clean, effective search engine queries.
+
+    Acts as a lightweight, course-agnostic fallback when LLM-generated search queries
+    are unavailable (e.g. during provider timeout or offline mode).
+    """
+    if not query:
+        return ""
+    # Strip leading/trailing punctuation and markdown delimiters
+    cleaned = re.sub(r"[\?\!\*\"'`#\(\)\[\]]+", " ", query).strip()
+
+    # Strip universal conversational question starters (domain-agnostic)
+    cleaned = re.sub(
+        r"^(?:"
+        r"cho\s+tôi\s+biết(?:\s+về)?|"
+        r"làm\s+sao\s+(?:để)?|"
+        r"làm\s+thế\s+nào\s+(?:để)?|"
+        r"tại\s+sao(?:\s+khi)?|"
+        r"hướng\s+dẫn(?:\s+cách)?|"
+        r"giúp\s+tôi(?:\s+với)?|"
+        r"giải\s+thích(?:\s+giúp\s+tôi)?|"
+        r"hãy\s+cho\s+biết|"
+        r"có\s+thể\s+cho\s+biết|"
+        r"xin\s+hỏi|"
+        r"tìm\s+hiểu\s+về|"
+        r"what\s+is\s+(?:the)?|"
+        r"how\s+to|"
+        r"why\s+does|"
+        r"explain\s+how"
+        r")\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Strip universal conversational question endings
+    cleaned = re.sub(
+        r"\s+(?:"
+        r"như\s+thế\s+nào|"
+        r"là\s+gì|"
+        r"có\s+được\s+không|"
+        r"thế\s+nào|"
+        r"được\s+không|"
+        r"dùng\s+để\s+làm\s+gì|"
+        r"có\s+ý\s+nghĩa\s+gì"
+        r")$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Dynamically inject primary subject from course metadata (works for any subject/domain)
+    if class_name:
+        raw_subject = re.split(r"[:\-\–&|]|\bSection\b", class_name)[0].strip()
+        core_tokens = raw_subject.split()[:3]
+        if core_tokens:
+            subject_tag = " ".join(core_tokens)
+            if subject_tag.lower() not in cleaned.lower():
+                cleaned = f"{subject_tag} {cleaned}"
+
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+BROWSER_USER_AGENT = (
+    "CourseQAAgent/1.0 (academic-course-qa@academic.edu.vn; +http://localhost) "
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def is_url_accessible(
+    url: str,
+    timeout: float | None = None,
+    client: httpx.Client | None = None,
+) -> bool:
+    """Verify that an external web URL is live and accessible.
+
+    Checks that the URL does not return 404 (Not Found), 410 (Gone), 5xx server errors,
+    hard 403 (Access Denied / Paywall), or connection/DNS timeouts.
+    If a 403 is an anti-bot challenge on an approved Tier 1-3 domain (such as Cloudflare on
+    Stack Overflow), it is accepted since a student's real browser can load it.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+
+    clean_target = url.split("#")[0]
+    probe_timeout = timeout if timeout is not None else settings.serpapi_url_probe_timeout
+
+    headers = {
+        "User-Agent": BROWSER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+    }
+
+    def _check_with_client(c: httpx.Client) -> bool:
+        # 1. Attempt lightweight HEAD request
+        try:
+            head_resp = c.head(clean_target)
+            if head_resp.status_code < 400:
+                return True
+            if head_resp.status_code in (403, 404, 410):
+                return False
+        except (httpx.HTTPError, OSError) as exc:
+            logger.debug("HEAD probe failed for %s: %s", clean_target, exc)
+
+        # 2. Fall back to streaming GET for servers that block HEAD
+        try:
+            with c.stream("GET", clean_target) as get_resp:
+                if get_resp.status_code < 400:
+                    return True
+                # Strictly prune any 4xx (403 Access Denied, 404 Not Found, 410 Gone) or 5xx
+                logger.info(
+                    "Pruning inaccessible URL %s due to HTTP status %d",
+                    clean_target,
+                    get_resp.status_code,
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("GET probe failed for %s: %s", clean_target, exc)
+            return False
+
+    try:
+        if client is not None:
+            return _check_with_client(client)
+        with httpx.Client(
+            timeout=probe_timeout,
+            follow_redirects=True,
+            verify=False,
+            headers=headers,
+        ) as local_client:
+            return _check_with_client(local_client)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("URL accessibility check failed for %s: %s", clean_target, exc)
+        return False
+
+
+def filter_accessible_web_results(
+    results: Sequence[WebResult],
+    timeout: float | None = None,
+    probe_fn: Callable[[str], bool] | None = None,
+    max_workers: int = 5,
+) -> list[WebResult]:
+    """Filter candidate web results concurrently, pruning dead and inaccessible links.
+
+    Preserves the original ranking order among accessible results.
+    """
+    if not results:
+        return []
+
+    probe = probe_fn if probe_fn is not None else (lambda u: is_url_accessible(u, timeout=timeout))
+
+    if len(results) == 1:
+        if probe(results[0].url):
+            return list(results)
+        logger.info("Pruned dead/inaccessible web URL: %s", results[0].url)
+        return []
+
+    accessible_results: list[WebResult] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(results), max_workers)) as executor:
+        future_to_result = {
+            executor.submit(probe, item.url): item
+            for item in results
+        }
+        for future in concurrent.futures.as_completed(future_to_result):
+            item = future_to_result[future]
+            try:
+                if future.result():
+                    accessible_results.append(item)
+                else:
+                    logger.info("Pruned dead/inaccessible web URL: %s (%s)", item.title, item.url)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error probing web URL %s: %s", item.url, exc)
+
+    accessible_ids = {id(r) for r in accessible_results}
+    ordered = [r for r in results if id(r) in accessible_ids]
+    return ordered
+
+
+def search_internet(
+    question: str,
+    verify_urls: bool | None = None,
+    probe_fn: Callable[[str], bool] | None = None,
+) -> list[WebResult]:
     """T19 Internet source agent powered by SerpApi (Google Search) (AI-67).
 
     Uses Google's organic results so answers cite mainstream, well-maintained
     pages instead of the low-traffic sites a metered search API tends to return.
+    Also verifies link accessibility to prune 404s and dead links.
     """
 
     api_key = settings.serpapi_api_key
@@ -491,30 +678,60 @@ def search_internet(question: str) -> list[WebResult]:
         logger.info("SERPAPI_API_KEY is not configured; returning no web results.")
         return []
 
-    try:
-        jump_builder = None
+    search_query = sanitize_web_query(question) if not question.startswith(("http", "www.")) else question
+
+    def _fetch_and_filter(target_q: str) -> list[WebResult]:
         try:
-            from app.services.citation_service import build_universal_jump_url
+            resp = _get_search_client().get(
+                SERPAPI_SEARCH_ENDPOINT,
+                params=_serpapi_params(target_q, api_key),
+            )
+            resp.raise_for_status()
+            results = _serpapi_web_results(resp.json())
+            unblocked = [item for item in results if not search_config.is_blocked(item.url)]
+            q_words = citation_service._content_words(target_q or question) - citation_service._GENERIC_MATCH_WORDS
+            if q_words:
+                filtered = [
+                    item for item in unblocked
+                    if bool(q_words & citation_service._content_words(f"{item.title} {item.content} {item.url}"))
+                ]
+                if filtered or isinstance(_get_search_client(), httpx.Client):
+                    return filtered
+            return unblocked
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SerpApi search attempt failed for %r: %s", target_q, exc)
+            return []
 
-            jump_builder = build_universal_jump_url
-        except ImportError:
-            pass
+    try:
+        allowed = _fetch_and_filter(search_query or question)
 
-        response = _get_search_client().get(
-            SERPAPI_SEARCH_ENDPOINT,
-            params=_serpapi_params(question, api_key),
-        )
-        response.raise_for_status()
-        web_results = _serpapi_web_results(response.json(), jump_builder)
+        # Fallback if primary query yielded 0 relevant results (e.g. Google diluted on generic terms)
+        if not allowed and question:
+            core_words = citation_service._content_words(f"{question} {search_query}") - citation_service._GENERIC_MATCH_WORDS
+            fallback_query = f"{' '.join(list(core_words)[:3])} algorithm" if core_words else sanitize_web_query(question)
+            if fallback_query and fallback_query != search_query:
+                logger.info("Primary search returned 0 relevant hits. Retrying with fallback query: %r", fallback_query)
+                allowed = _fetch_and_filter(fallback_query)
 
-        # Google does not accept an include/exclude domain list, so the shared
-        # reputation tiers are applied locally: blocked sites are dropped and
-        # the rest are ranked Tier 1 -> Tier 2 -> Tier 3 -> unknown.
-        allowed = [item for item in web_results if not search_config.is_blocked(item.url)]
         allowed.sort(key=lambda item: search_config.get_source_tier(item.url) or 99)
+
+        # Health probe: Filter out 404, 410, and inaccessible URLs
+        should_verify = (
+            verify_urls
+            if verify_urls is not None
+            else (settings.serpapi_verify_urls and isinstance(_get_search_client(), httpx.Client))
+        )
+        if should_verify or probe_fn is not None:
+            candidate_pool = allowed[: SERPAPI_MAX_RESULTS + 3]
+            verified = filter_accessible_web_results(candidate_pool, probe_fn=probe_fn)
+            if verified:
+                allowed = verified
+            elif candidate_pool and not verified and probe_fn is not None:
+                allowed = []
+
         web_results = allowed[:SERPAPI_MAX_RESULTS]
 
-        logger.info("SerpApi search returned %d results for %r", len(web_results), question)
+        logger.info("SerpApi search returned %d results for %r (query: %r)", len(web_results), question, search_query)
         return web_results
     except Exception as exc:  # noqa: BLE001
         logger.warning("SerpApi search failed: %s", exc)
@@ -618,20 +835,39 @@ def answer_question(
     )
 
 
+def _format_page_label(pages: Sequence[int]) -> str | None:
+    if not pages:
+        return None
+    sorted_pages = sorted(set(pages))
+    if len(sorted_pages) == 1:
+        return str(sorted_pages[0])
+    if sorted_pages == list(range(sorted_pages[0], sorted_pages[-1] + 1)):
+        return f"{sorted_pages[0]}-{sorted_pages[-1]}"
+    return ", ".join(str(p) for p in sorted_pages)
+
+
 def curriculum_citations(chunks: Sequence[ScoredChunk]) -> list[Source]:
     """Build provisional source labels; final passages require answer markers."""
 
-    return [
-        Source(
-            index=index,
-            kind=SOURCE_CURRICULUM,
-            title=chunk.title,
-            snippet=chunk.content[:CITATION_SNIPPET_LENGTH],
-            document_id=chunk.document_id or None,
-            page=chunk.page,
+    sources: list[Source] = []
+    for index, chunk in enumerate(chunks, start=1):
+        passage = citation_service.extract_best_sentence(chunk.content)
+        highlights = (passage,) if passage else ()
+        p = chunk.page
+        sources.append(
+            Source(
+                index=index,
+                kind=SOURCE_CURRICULUM,
+                title=chunk.title,
+                snippet=chunk.content[:CITATION_SNIPPET_LENGTH],
+                document_id=chunk.document_id or None,
+                page=p,
+                pages=(p,) if p is not None else (),
+                page_label=str(p) if p is not None else None,
+                highlights=highlights,
+            )
         )
-        for index, chunk in enumerate(chunks, start=1)
-    ]
+    return sources
 
 
 def cited_markers(answer: str) -> set[int]:
@@ -649,26 +885,80 @@ def cited_page_citations(
 ) -> list[Source]:
     """Citations for only the pages whose passages the answer referenced.
 
-    Chunks from the same document page collapse into a single citation that
-    carries every passage used (``highlights``) so the UI can mark them on
-    that page. An answer without markers (greeting, "not covered") yields no
+    Chunks from the same document section or page collapse into a single citation that
+    carries every passage used (``highlights``) and page range (``pages``, ``page_label``)
+    so the UI can mark them continuously across pages. An answer without markers yields no
     citations at all.
     """
     passages = citation_service.extract_cited_passages(answer, chunks, question=question)
 
-    grouped: dict[tuple[str, int | None], list[tuple[int, ScoredChunk]]] = {}
-    for index, chunk in enumerate(chunks, start=1):
-        if index not in passages:
-            continue
-        grouped.setdefault((chunk.document_id, chunk.page), []).append((index, chunk))
+    cited_items = [
+        (index, chunk)
+        for index, chunk in enumerate(chunks, start=1)
+        if passages.get(index)
+    ]
+
+    groups: list[list[tuple[int, ScoredChunk]]] = []
+    for index, chunk in cited_items:
+        doc_id = chunk.document_id
+        page = chunk.page
+        sec = citation_service._chunk_section_path(getattr(chunk, "metadata", None))
+
+        merged = False
+        for g in groups:
+            _first_idx, first_chunk = g[0]
+            if first_chunk.document_id != doc_id:
+                continue
+
+            g_pages = {c.page for _, c in g if c.page is not None}
+
+            # Rule 1: Same document and same page -> always merge into one citation chip
+            if page is not None and page in g_pages:
+                g.append((index, chunk))
+                merged = True
+                break
+
+            # Rule 2: Same document, adjacent page(s), and related section -> merge into continuous multi-page range
+            if page is not None and any(abs(p - page) <= 1 for p in g_pages):
+                first_sec = citation_service._chunk_section_path(getattr(first_chunk, "metadata", None))
+                if sec and first_sec:
+                    sec_stem = sec.split(" > ")[-1]
+                    first_sec_stem = first_sec.split(" > ")[-1]
+                    if (
+                        sec == first_sec
+                        or sec.startswith(first_sec)
+                        or first_sec.startswith(sec)
+                        or sec_stem == first_sec_stem
+                    ):
+                        g.append((index, chunk))
+                        merged = True
+                        break
+
+            # Rule 3: Documents without pages (e.g. text/markdown) with matching section
+            if page is None and not g_pages:
+                first_sec = citation_service._chunk_section_path(getattr(first_chunk, "metadata", None))
+                if sec == first_sec:
+                    g.append((index, chunk))
+                    merged = True
+                    break
+
+        if not merged:
+            groups.append([(index, chunk)])
 
     sources: list[Source] = []
-    for position, ((document_id, page), members) in enumerate(grouped.items(), start=1):
+    for position, members in enumerate(groups, start=1):
         first = members[0][1]
+        document_id = first.document_id
+        all_pages = sorted({c.page for _, c in members if c.page is not None})
+        first_page = all_pages[0] if all_pages else first.page
+        page_label = _format_page_label(all_pages)
+
         highlights = tuple(dict.fromkeys(
-            passage for index, _chunk in members for passage in passages[index]
+            passage for index, _chunk in members for passage in passages.get(index, ()) if passage
         ))
-        preview = highlights[0] if highlights else citation_service.extract_best_sentence(first.content)
+        if not highlights:
+            continue
+        preview = highlights[0]
         sources.append(
             Source(
                 index=position,
@@ -676,7 +966,9 @@ def cited_page_citations(
                 title=first.title,
                 snippet=preview[:CITATION_SNIPPET_LENGTH],
                 document_id=document_id or None,
-                page=page,
+                page=first_page,
+                pages=tuple(all_pages),
+                page_label=page_label,
                 indexes=tuple(index for index, _ in members),
                 highlights=highlights,
             )

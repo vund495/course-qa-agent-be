@@ -187,6 +187,16 @@ class Settings(BaseSettings):
         le=60.0,
         validation_alias="SERPAPI_TIMEOUT_SECONDS",
     )
+    serpapi_verify_urls: bool = Field(
+        default=True,
+        validation_alias="SERPAPI_VERIFY_URLS",
+    )
+    serpapi_url_probe_timeout: float = Field(
+        default=2.0,
+        ge=0.5,
+        le=10.0,
+        validation_alias="SERPAPI_URL_PROBE_TIMEOUT",
+    )
 
     # DB-backed auth (E1 / AI-25, AI-27, AI-31). Dev defaults only — override in prod.
     jwt_secret: str = Field(

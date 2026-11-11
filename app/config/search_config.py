@@ -58,6 +58,14 @@ TIER1_OFFICIAL_DOMAINS: list[str] = [
     "developer.apple.com",
     "w3.org",
     "ietf.org",
+    # --- C & C++ Official Standards & Reference Documentation ---
+    "cppreference.com",
+    "cplusplus.com",
+    "learncpp.com",
+    "isocpp.org",
+    "gnu.org",
+    "llvm.org",
+    "boost.org",
     # --- Việt Nam: cơ quan quản lý & trường đại học chính thức ---
     "moet.gov.vn",
     "vnu.edu.vn",
@@ -80,6 +88,7 @@ TIER1_OFFICIAL_DOMAINS: list[str] = [
 TIER2_REFERENCE_DOMAINS: list[str] = [
     "wikipedia.org",
     "britannica.com",
+    "stackexchange.com",
     "refactoring.guru",
     "martinfowler.com",
     "baeldung.com",
@@ -88,6 +97,8 @@ TIER2_REFERENCE_DOMAINS: list[str] = [
     "redhat.com",
     "geeksforgeeks.org",
     "kaggle.com",
+    "codelearn.io",
+    "28tech.com.vn",
     "mathworld.wolfram.com",
     "coursera.org",
     "edx.org",
@@ -103,6 +114,9 @@ TIER3_COMMUNITY_DOMAINS: list[str] = [
     "stackoverflow.com",
     "github.com",
     "viblo.asia",
+    "daynhauhoc.com",
+    "howkteam.vn",
+    "kteam.vn",
 ]
 
 DEFAULT_TRUSTED_WEB_DOMAINS: list[str] = (
@@ -113,6 +127,16 @@ DEFAULT_TRUSTED_WEB_DOMAINS: list[str] = (
 # Chặn hoàn toàn (Mạng xã hội, web rác, gian lận học thuật & giải đề lậu)
 # ---------------------------------------------------------------------------
 DEFAULT_BLOCKED_WEB_DOMAINS: list[str] = [
+    # Video & audio platforms (không thể trích dẫn văn bản học thuật)
+    "youtube.com",
+    "youtu.be",
+    "vimeo.com",
+    "dailymotion.com",
+    "spotify.com",
+    "soundcloud.com",
+    # Từ điển từ đơn & wiki không chuyên
+    "wiktionary.org",
+    "wikihow.com",
     # Mạng xã hội & diễn đàn hỏi đáp phi học thuật
     "pinterest.com",
     "quora.com",
@@ -121,6 +145,7 @@ DEFAULT_BLOCKED_WEB_DOMAINS: list[str] = [
     "instagram.com",
     "twitter.com",
     "x.com",
+    "threads.net",
     "reddit.com",
     # Nội dung do người dùng tự do đăng, chất lượng không kiểm duyệt
     "medium.com",
@@ -130,6 +155,7 @@ DEFAULT_BLOCKED_WEB_DOMAINS: list[str] = [
     "chegg.com",
     "coursehero.com",
     "studocu.com",
+    "studocu.vn",
     "scribd.com",
     "slideshare.net",
     # Site giải bài tập / văn mẫu / tài liệu lậu tại Việt Nam
@@ -138,13 +164,25 @@ DEFAULT_BLOCKED_WEB_DOMAINS: list[str] = [
     "hoc247.net",
     "tailieu.vn",
     "123docz.net",
+    # Gaming, esports, browser extensions & entertainment platforms
+    "twitch.tv",
+    "fandom.com",
+    "steampowered.com",
+    "epicgames.com",
+    "ign.com",
+    "gamespot.com",
+    "gamek.vn",
+    "genk.vn",
+    "roblox.com",
+    "discord.com",
+    "cplx.app",
 ]
 
 # Number of ranked web results kept for citation after reputation filtering
 SERPAPI_MAX_RESULTS: int = int(os.getenv("SERPAPI_MAX_RESULTS", "3"))
 
 # Google results requested before filtering (a wider net keeps 5 good hits)
-SERPAPI_FETCH_RESULTS: int = int(os.getenv("SERPAPI_FETCH_RESULTS", "10"))
+SERPAPI_FETCH_RESULTS: int = int(os.getenv("SERPAPI_FETCH_RESULTS", "15"))
 
 TRUSTED_WEB_DOMAINS: list[str] = list(DEFAULT_TRUSTED_WEB_DOMAINS)
 BLOCKED_WEB_DOMAINS: list[str] = list(DEFAULT_BLOCKED_WEB_DOMAINS)
@@ -163,11 +201,13 @@ def _matches(host: str, domains: list[str]) -> bool:
 
 
 def is_blocked(url: str) -> bool:
-    """Trả về True khi host nằm trong danh sách chặn cứng."""
+    """Trả về True khi host nằm trong danh sách chặn cứng hoặc là domain game/esports."""
 
     host = _host(url)
     if not host:
         return False
+    if host.endswith(".gg"):
+        return True
     return _matches(host, DEFAULT_BLOCKED_WEB_DOMAINS)
 
 

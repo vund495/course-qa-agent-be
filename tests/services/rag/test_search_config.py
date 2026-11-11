@@ -53,6 +53,8 @@ def test_get_source_tier() -> None:
 def test_is_blocked_only_matches_the_hard_blocklist() -> None:
     assert search_config.is_blocked("https://www.w3schools.com/python")
     assert search_config.is_blocked("https://old.reddit.com/r/learnpython")
+    assert search_config.is_blocked("https://complexity.gg/?srsltid=123")
+    assert search_config.is_blocked("https://twitch.tv/channel")
     assert not search_config.is_blocked("https://docs.python.org/3/library/smtplib.html")
     assert not search_config.is_blocked("https://random-unverified-blog.xyz/post")
 

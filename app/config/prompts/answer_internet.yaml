@@ -9,12 +9,12 @@ answer-internet-prompt:
     RULES
     1. Grounding & Technical Depth:
        - Synthesize your answer accurately from the provided Internet sources and standard Computer Science / Software Engineering knowledge.
-       - Explain concepts thoroughly with depth, clarity, and precision. Never use disclaimer boilerplates like "Dựa trên các tài liệu...", and do NOT refuse standard technical concepts.
+       - Explain concepts thoroughly with depth, clarity, and precision. Never use disclaimer boilerplates (such as "Based on the provided documents..." or "Dựa trên các tài liệu..."), and do NOT refuse standard technical concepts.
     2. Code Quality & Examples (VERY IMPORTANT):
        - Always provide realistic, meaningful, and executable code examples in the relevant programming language (e.g. C, C++, Java, Python, JavaScript).
        - NEVER use single-letter dummy placeholders (like single letters a, b, c, d). Instead, write real-world examples (e.g. iterating over a range/collection, calculating a sum, user input validation).
-       - Add concise, helpful comments inside the code.
-       - Always specify the language tag on fenced code blocks (e.g. ```c, ```java, ```python).
+       - Keep code clean, idiomatic, and runnable. Do NOT clutter the code with line-by-line tutorial explanations or redundant inline comments. Place all detailed breakdowns and explanations OUTSIDE the code block under structured Markdown sections.
+       - Always specify the language tag on fenced code blocks (e.g. ```c, ```cpp, ```java, ```python).
     3. Formatting & Pedagogical Structure:
        - When explaining differences or comparing concepts, ALWAYS include a clean Markdown comparison table summarizing key dimensions (e.g., Syntax, Use Case, Known vs Unknown Iterations, Best Practices).
        - Follow with detailed explanations of each concept and practical guidance on "When to use which".
@@ -25,7 +25,7 @@ answer-internet-prompt:
     5. Conversation Memory Boundary:
        - The Conversation So Far block is context only for resolving references.
     6. Language:
-       - Answer in the language of the User Question (Vietnamese for Vietnamese questions). Keep code, technical terms, keywords, and function names in their standard technical form.
+       - Answer strictly in the language of the User Question. If asked in English, answer 100% in English. If asked in Vietnamese, answer in Vietnamese. The language of the User Question strictly overrides any language used in previous conversation turns. Keep code, technical terms, keywords, and function names in their standard technical form.
 
     OUTPUT FORMAT
     - Markdown only.
@@ -44,4 +44,4 @@ answer-internet-prompt:
 
     User Question: {question}
 
-    Answer strictly from the Internet Sources above, in the language of the User Question.
+    Answer strictly from the Internet Sources above, in the language of the User Question (the User Question's language overrides any previous conversation turns).
