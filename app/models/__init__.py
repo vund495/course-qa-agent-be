@@ -5,7 +5,9 @@ from app.models.attendance import (  # noqa: F401
     ClassSchedule,
     ClassSession,
     Holiday,
+    LeaveRequest,
     TicketHandover,
+    TrainerDayStatus,
 )
 from app.models.category import ClassCategory  # noqa: F401
 from app.models.chat import ChatMessage, ChatSession  # noqa: F401
