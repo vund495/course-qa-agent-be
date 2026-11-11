@@ -16,8 +16,8 @@ from datetime import date, datetime
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.attendance import Attendance, ClassSession
-from app.models.course import Class, Enrollment
+from app.models.attendance import Attendance, ClassSchedule, ClassSession
+from app.models.course import Class, ClassInfo, Enrollment
 from app.models.user import User
 from app.schemas.attendance import (
     AttendanceCounts,
@@ -29,10 +29,13 @@ from app.schemas.attendance import (
     ClassSessionRead,
     StudentAttendanceItem,
     StudentAttendanceRead,
+    StudentScheduleHolidayRead,
+    StudentScheduleRead,
+    StudentScheduleSessionRead,
 )
 from app.services import schedule_service
 from app.services.course_service import DomainError
-from app.services.holiday_service import VIETNAM_TZ, local_date
+from app.services.holiday_service import VIETNAM_TZ, holidays_between, local_date
 
 logger = logging.getLogger(__name__)
 
@@ -485,5 +488,125 @@ def get_student_history(
         attended=p_cnt + l_cnt,
         attendance_rate=rate,
         items=items,
+    )
+
+
+def get_student_schedule(
+    db: Session,
+    clazz: Class,
+    student_id: uuid.UUID,
+    date_from: date,
+    date_to: date,
+    *,
+    today: date | None = None,
+) -> StudentScheduleRead:
+    """Return the caller's dated class schedule for a week or month (AI-157).
+
+    Unlike :func:`get_student_history`, this includes future sessions, because
+    the student needs to know when and where to attend. Holidays are returned
+    separately so the client can label them without guessing from missing
+    sessions. Attendance status is limited to the calling student's own rows.
+    """
+    is_active = (
+        db.query(Enrollment)
+        .filter(
+            Enrollment.class_id == clazz.id,
+            Enrollment.student_id == student_id,
+            Enrollment.status == "ACTIVE",
+        )
+        .first()
+    )
+    if is_active is None:
+        raise StudentNotInRosterError(
+            f"Student {student_id} is not an active enrolled member of class {clazz.id}."
+        )
+
+    if today is None:
+        today = local_date(datetime.now(VIETNAM_TZ))
+
+    # Materialise the whole requested range, including future weeks/months.
+    sessions = schedule_service.generate_sessions(db, clazz, date_from, date_to)
+    session_ids = [session.id for session in sessions]
+
+    attendance_map: dict[uuid.UUID, Attendance] = {}
+    if session_ids:
+        rows = (
+            db.query(Attendance)
+            .filter(
+                Attendance.class_session_id.in_(session_ids),
+                Attendance.student_id == student_id,
+            )
+            .all()
+        )
+        attendance_map = {row.class_session_id: row for row in rows}
+
+    schedule_ids = {s.schedule_id for s in sessions if s.schedule_id is not None}
+    subject_map: dict[uuid.UUID, str] = {}
+    if schedule_ids:
+        subject_map = {
+            schedule_id: subject
+            for schedule_id, subject in (
+                db.query(ClassSchedule.id, ClassSchedule.subject)
+                .filter(ClassSchedule.id.in_(schedule_ids))
+                .all()
+            )
+        }
+
+    trainer_ids = {s.trainer_id for s in sessions}
+    trainer_name_map: dict[uuid.UUID, str] = {}
+    if trainer_ids:
+        trainer_name_map = {
+            trainer_id: full_name
+            for trainer_id, full_name in (
+                db.query(User.id, User.full_name).filter(User.id.in_(trainer_ids)).all()
+            )
+        }
+
+    # A class row wins over a system row on the same date, matching the shared
+    # holiday service's precedence rule. The calendar should render one label.
+    holidays_by_date = {}
+    for holiday in holidays_between(db, date_from, date_to, clazz.id):
+        existing = holidays_by_date.get(holiday.date)
+        if existing is None or holiday.scope == "class":
+            holidays_by_date[holiday.date] = holiday
+    holidays = sorted(holidays_by_date.values(), key=lambda holiday: holiday.date)
+
+    class_info = db.query(ClassInfo).filter(ClassInfo.class_id == clazz.id).first()
+
+    session_items: list[StudentScheduleSessionRead] = []
+    for session in sessions:
+        attendance = attendance_map.get(session.id)
+        session_items.append(
+            StudentScheduleSessionRead(
+                id=session.id,
+                date=session.date,
+                start_at=session.start_at,
+                end_at=session.end_at,
+                subject=subject_map.get(session.schedule_id, clazz.name),
+                trainer_name=trainer_name_map.get(session.trainer_id),
+                status=session.status,
+                attendance_status=attendance.status if attendance else None,
+                attendance_note=attendance.note if attendance else None,
+            )
+        )
+
+    return StudentScheduleRead(
+        class_id=clazz.id,
+        class_code=clazz.code,
+        class_name=clazz.name,
+        date_from=date_from,
+        date_to=date_to,
+        today=today,
+        meeting_url=class_info.meeting_url if class_info else None,
+        sessions=session_items,
+        holidays=[
+            StudentScheduleHolidayRead(
+                date=holiday.date,
+                name=holiday.name,
+                type=holiday.type,
+                scope=holiday.scope,
+            )
+            for holiday in holidays
+        ],
     )
 
