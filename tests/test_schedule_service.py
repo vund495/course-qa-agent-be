@@ -517,3 +517,162 @@ def test_list_sessions_computes_attendance_counts(db_session):
     session_read = res[0]
     assert session_read.student_count == 2
     assert session_read.marked_count == 1
+
+
+@pytest.mark.parametrize(
+    "leave_status, scoped_elsewhere, expected",
+    [
+        ("accepted", False, True),
+        ("pending", False, False),
+        ("rejected", False, False),
+        ("accepted", True, False),
+    ],
+)
+def test_session_calendar_flags_respect_leave_approval_and_class(
+    db_session, leave_status, scoped_elsewhere, expected
+):
+    from app.models.attendance import LeaveRequest
+    from app.services import attendance_service
+
+    trainer = _make_user(db_session, "flags@calendar.test")
+    assistant = _make_user(db_session, "assistant@calendar.test")
+    student = _make_user(db_session, "student@calendar.test", role_name="student")
+    clazz = _make_class(db_session, trainer, code="FLAGS")
+    other_class = _make_class(db_session, trainer, code="OTHER-FLAGS")
+    day = date(2026, 11, 12)
+    session = ClassSession(
+        class_id=clazz.id,
+        date=day,
+        start_at=datetime.combine(day, time(9), tzinfo=VIETNAM_TZ),
+        end_at=datetime.combine(day, time(11), tzinfo=VIETNAM_TZ),
+        trainer_id=trainer.id,
+        status="scheduled",
+    )
+    leave = LeaveRequest(
+        trainer_id=trainer.id,
+        class_id=other_class.id if scoped_elsewhere else clazz.id,
+        target_trainer_id=assistant.id,
+        date_from=day,
+        date_to=day,
+        reason_type="health",
+        reason_details="Rest",
+        status=leave_status,
+    )
+    db_session.add_all(
+        [
+            session,
+            leave,
+            Enrollment(class_id=clazz.id, student_id=student.id, status="ACTIVE"),
+            Holiday(date=day, name="System", type="admin", scope="system"),
+            Holiday(date=day, name="Class holiday", type="admin", scope="class", class_id=clazz.id),
+        ]
+    )
+    db_session.commit()
+    reads = schedule_service.list_sessions(db_session, clazz, day, day)
+    assert len(reads) == 1
+    response = reads[0]
+    assert response.is_holiday is True
+    assert response.holiday_name == "Class holiday"
+    assert response.trainer_on_leave is expected
+    if expected:
+        assert response.trainer_leave.id == leave.id
+        assert response.trainer_leave.target_trainer_id == assistant.id
+        assert response.trainer_leave.reason_details == "Rest"
+    else:
+        assert response.trainer_leave is None
+    sheet = attendance_service.get_sheet(db_session, clazz, session.id)
+    assert sheet.session.holiday_name == "Class holiday"
+    assert sheet.session.trainer_on_leave is expected
+    student_schedule = attendance_service.get_student_schedule(
+        db_session, clazz, student.id, day, day
+    )
+    assert student_schedule.sessions[0].holiday_name == "Class holiday"
+    assert student_schedule.sessions[0].trainer_on_leave is expected
+    assert db_session.get(ClassSession, session.id).status == "scheduled"
+
+
+def test_legacy_leave_flags_only_sessions_assigned_to_absent_trainer(db_session):
+    from app.models.attendance import LeaveRequest
+
+    trainer = _make_user(db_session, "legacy@calendar.test")
+    other = _make_user(db_session, "present@calendar.test")
+    clazz = _make_class(db_session, trainer, code="LEGACY-FLAGS")
+    day = date(2026, 11, 12)
+    db_session.add_all(
+        [
+            ClassSession(
+                class_id=clazz.id,
+                date=day,
+                start_at=datetime.combine(day, time(hour), tzinfo=VIETNAM_TZ),
+                end_at=datetime.combine(day, time(hour + 1), tzinfo=VIETNAM_TZ),
+                trainer_id=assigned.id,
+                status="scheduled",
+            )
+            for hour, assigned in ((9, trainer), (13, other))
+        ]
+    )
+    db_session.add(
+        LeaveRequest(
+            trainer_id=trainer.id,
+            class_id=None,
+            target_trainer_id=None,
+            date_from=day,
+            date_to=day,
+            reason_type="other",
+            status="accepted",
+        )
+    )
+    db_session.commit()
+    reads = schedule_service.list_sessions(db_session, clazz, day, day)
+    assert [row.trainer_on_leave for row in reads] == [True, False]
+    assert all(row.is_holiday is False for row in reads)
+    assert reads[0].trainer_leave.target_trainer_name is None
+
+
+def test_calendar_flags_use_bounded_queries_for_many_sessions(db_session):
+    from sqlalchemy import event
+
+    from app.models.attendance import LeaveRequest
+
+    trainer = _make_user(db_session, "batch@calendar.test")
+    assistant = _make_user(db_session, "cover@calendar.test")
+    clazz = _make_class(db_session, trainer, code="BATCH-FLAGS")
+    sessions = []
+    for day_number in range(1, 21):
+        day = date(2026, 11, day_number)
+        sessions.append(
+            ClassSession(
+                class_id=clazz.id,
+                date=day,
+                start_at=datetime.combine(day, time(9), tzinfo=VIETNAM_TZ),
+                end_at=datetime.combine(day, time(11), tzinfo=VIETNAM_TZ),
+                trainer_id=trainer.id,
+                status="scheduled",
+            )
+        )
+    db_session.add_all(sessions)
+    db_session.add(
+        LeaveRequest(
+            trainer_id=trainer.id,
+            class_id=clazz.id,
+            target_trainer_id=assistant.id,
+            date_from=date(2026, 11, 1),
+            date_to=date(2026, 11, 20),
+            reason_type="other",
+            status="accepted",
+        )
+    )
+    db_session.commit()
+    statements = []
+
+    def capture(connection, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(db_session.bind, "before_cursor_execute", capture)
+    try:
+        flags = schedule_service.session_calendar_flags(db_session, clazz, sessions)
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", capture)
+    assert len(flags) == 20
+    assert all(row["trainer_on_leave"] for row in flags.values())
+    assert len(statements) <= 3

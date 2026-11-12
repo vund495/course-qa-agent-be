@@ -7,7 +7,6 @@ from typing import Any
 from sqlalchemy import exists, func, or_, update
 from sqlalchemy.orm import Session
 
-from app.models.attendance import TrainerDayStatus
 from app.models.course import Class, ClassTrainer, Enrollment
 from app.models.system_config import SystemConfig
 from app.models.ticket import Ticket, TicketReply
@@ -15,7 +14,8 @@ from app.models.user import User
 from app.schemas.handover import AdminQueueItem
 from app.schemas.tickets import TicketClassCounts, TicketInboxItem, TicketStatus
 from app.services.availability_service import is_available
-from app.services.course_service import class_ids_for_trainer, list_trainers
+from app.services.course_service import class_ids_for_ticket_staff as class_ids_for_trainer
+from app.services.course_service import list_trainers
 from app.services.handover_service import sweep_for_trainer
 from app.services.holiday_service import business_elapsed, holiday_dates, local_date
 from app.services.user_service import role_name_of
@@ -187,7 +187,9 @@ def create_student_ticket(
     return ticket
 
 
-def get_student_ticket(db: Session, *, ticket_id: uuid.UUID, student_id: uuid.UUID) -> Ticket | None:
+def get_student_ticket(
+    db: Session, *, ticket_id: uuid.UUID, student_id: uuid.UUID
+) -> Ticket | None:
     expire_open_tickets(db)
     ticket = (
         db.query(Ticket)
@@ -367,12 +369,18 @@ def ticket_counts_for_trainer(
 def _build_inbox_item(row) -> TicketInboxItem:
     ticket, student_name, class_name, class_code, class_status = row
     return TicketInboxItem(
-        id=ticket.id, class_id=ticket.class_id, student_id=ticket.student_id,
-        question=ticket.question, original_question=ticket.original_question,
-        status=ticket.status, created_at=ticket.created_at,
+        id=ticket.id,
+        class_id=ticket.class_id,
+        student_id=ticket.student_id,
+        question=ticket.question,
+        original_question=ticket.original_question,
+        status=ticket.status,
+        created_at=ticket.created_at,
         agent_answer=ticket.agent_answer,
-        citations=ticket.citations, source_message_id=ticket.source_message_id,
-        escalated_to_id=ticket.escalated_to_id, escalated_at=ticket.escalated_at,
+        citations=ticket.citations,
+        source_message_id=ticket.source_message_id,
+        escalated_to_id=ticket.escalated_to_id,
+        escalated_at=ticket.escalated_at,
         escalated_to_name=ticket.escalated_to_name,
         student_seen_at=ticket.student_seen_at,
         owner_trainer_id=ticket.owner_trainer_id,
@@ -382,7 +390,9 @@ def _build_inbox_item(row) -> TicketInboxItem:
         handover_from_name=ticket.handover_from_name,
         handover_reason=ticket.handover_reason,
         handover_at=ticket.handover_at,
-        student_name=student_name, class_name=class_name, class_code=class_code,
+        student_name=student_name,
+        class_name=class_name,
+        class_code=class_code,
         class_status=class_status or "ACTIVE",
         replies=ticket.replies,
     )
@@ -428,24 +438,9 @@ def list_trainer_tickets(
     return _inbox_items(rows), total
 
 
-def _absent_trainer_names(
-    db: Session, class_id: uuid.UUID, day
-) -> list[str]:
+def _absent_trainer_names(db: Session, class_id: uuid.UUID, day) -> list[str]:
     trainers = list_trainers(db, class_id)
-    trainer_ids = [item["trainer_id"] for item in trainers]
-    if not trainer_ids:
-        return []
-    off_ids = {
-        row[0]
-        for row in db.query(TrainerDayStatus.trainer_id)
-        .filter(
-            TrainerDayStatus.date == day,
-            TrainerDayStatus.status == "off",
-            TrainerDayStatus.trainer_id.in_(trainer_ids),
-        )
-        .all()
-    }
-    return [item["name"] for item in trainers if item["trainer_id"] in off_ids]
+    return [item["name"] for item in trainers if not is_available(db, item["trainer_id"], day)]
 
 
 def list_admin_queue(db: Session) -> list[AdminQueueItem]:
@@ -458,7 +453,7 @@ def list_admin_queue(db: Session) -> list[AdminQueueItem]:
         .join(Class, Ticket.class_id == Class.id)
         .filter(
             Ticket.queued_for_admin_at.isnot(None),
-            Ticket.status == "OPEN",
+            Ticket.status.in_(("OPEN", "ANSWERED")),
         )
         .order_by(Ticket.queued_for_admin_at.asc(), Ticket.id.asc())
         .all()
@@ -506,9 +501,7 @@ def add_admin_reply(
     return reply
 
 
-def resolve_admin_ticket(
-    db: Session, *, ticket_id: uuid.UUID
-) -> Ticket | None:
+def resolve_admin_ticket(db: Session, *, ticket_id: uuid.UUID) -> Ticket | None:
     ticket = get_admin_ticket(db, ticket_id)
     if ticket is None or ticket.status not in RESOLVABLE_STATUSES:
         return None
@@ -546,7 +539,10 @@ def list_student_tickets(
             exists().where(
                 TicketReply.ticket_id == Ticket.id,
                 TicketReply.user_id != Ticket.student_id,
-                or_(Ticket.student_seen_at.is_(None), TicketReply.created_at > Ticket.student_seen_at),
+                or_(
+                    Ticket.student_seen_at.is_(None),
+                    TicketReply.created_at > Ticket.student_seen_at,
+                ),
             )
         )
     total = query.count()

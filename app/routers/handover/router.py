@@ -14,9 +14,12 @@ from app.models.user import User
 from app.routers.attendance.permissions import require_class_staff
 from app.schemas.handover import (
     AdminQueueItem,
+    AssistantAssign,
+    AssistantRead,
     HandoverRead,
     LeaveRequestCreate,
     LeaveRequestRead,
+    LeaveRequestReview,
     TrainerDayStatusRead,
     TrainerDayStatusSet,
 )
@@ -128,7 +131,9 @@ def get_my_trainer_status(
     _require_trainer_or_admin(current_user)
     resolved_day = day or _today()
     row = _get_status_row(db, current_user.id, resolved_day)
-    return _build_read(current_user.id, current_user.full_name, resolved_day, row)
+    read = _build_read(current_user.id, current_user.full_name, resolved_day, row)
+    read.status = availability_service.get_day_status(db, current_user.id, resolved_day)
+    return read
 
 
 @router.put(
@@ -160,14 +165,17 @@ def set_trainer_status(
                 detail="Trainer not found.",
             )
 
-    row = availability_service.set_day_status(
-        db,
-        target.id,
-        payload.date,
-        payload.status,
-        current_user.id,
-        payload.note,
-    )
+    try:
+        row = availability_service.set_day_status(
+            db,
+            target.id,
+            payload.date,
+            payload.status,
+            current_user.id,
+            payload.note,
+        )
+    except DomainError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return _build_read(target.id, target.full_name, payload.date, row)
 
 
@@ -208,7 +216,7 @@ def list_class_trainer_status(
         )
     row_map = {row.trainer_id: row for row in rows}
 
-    return [
+    reads = [
         _build_read(
             item["trainer_id"],
             item["name"],
@@ -217,6 +225,9 @@ def list_class_trainer_status(
         )
         for item in trainers
     ]
+    for read in reads:
+        read.status = availability_service.get_day_status(db, read.trainer_id, resolved_day)
+    return reads
 
 
 @router.get(
@@ -248,6 +259,9 @@ def create_leave_request(
         leave = leave_service.create_leave(
             db,
             trainer_id=current_user.id,
+            class_id=payload.class_id,
+            reason_type=payload.reason_type,
+            reason_details=payload.reason_details,
             date_from=payload.date_from,
             date_to=payload.date_to,
             target_trainer_id=payload.target_trainer_id,
@@ -284,7 +298,7 @@ def accept_leave_request(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> LeaveRequestRead:
-    _require_trainer(current_user)
+    _require_admin(current_user)
     try:
         leave = leave_service.respond_leave(
             db, leave_id=leave_id, actor_id=current_user.id, accept=True
@@ -301,14 +315,14 @@ def accept_leave_request(
 @router.post(
     "/leave-requests/{leave_id}/reject",
     response_model=LeaveRequestRead,
-    summary="Reject a leave request and run the automatic sweep",
+    summary="Reject a leave request",
 )
 def reject_leave_request(
     leave_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> LeaveRequestRead:
-    _require_trainer(current_user)
+    _require_admin(current_user)
     try:
         leave = leave_service.respond_leave(
             db, leave_id=leave_id, actor_id=current_user.id, accept=False
@@ -331,7 +345,8 @@ def list_my_handovers(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> list[HandoverRead]:
-    _require_trainer(current_user)
+    if _role_name(current_user) not in ("TRAINER", "TEACHING_ASSISTANT"):
+        raise HTTPException(403, "Only teaching staff can view handovers.")
     return [
         HandoverRead.model_validate(row)
         for row in handover_service.pending_handovers_for(db, current_user.id)
@@ -350,9 +365,7 @@ def accept_handover(
 ) -> HandoverRead:
     _require_trainer(current_user)
     try:
-        handover = handover_service.accept_handover(
-            db, handover_id, current_user.id
-        )
+        handover = handover_service.accept_handover(db, handover_id, current_user.id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -374,9 +387,7 @@ def reject_handover(
 ) -> HandoverRead:
     _require_trainer(current_user)
     try:
-        handover = handover_service.reject_handover(
-            db, handover_id, current_user.id
-        )
+        handover = handover_service.reject_handover(db, handover_id, current_user.id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -384,3 +395,106 @@ def reject_handover(
     except DomainError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return HandoverRead.model_validate(handover)
+
+
+@router.get("/admin/leaves", response_model=list[LeaveRequestRead])
+def list_admin_leaves(
+    status: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    from app.models.attendance import LeaveRequest
+
+    query = db.query(LeaveRequest)
+    if status:
+        query = query.filter(LeaveRequest.status == status)
+    return query.order_by(LeaveRequest.created_at.desc()).all()
+
+
+@router.post("/admin/leaves/{leave_id}/review", response_model=LeaveRequestRead)
+def review_leave(
+    leave_id: uuid.UUID,
+    payload: LeaveRequestReview,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    try:
+        row = leave_service.respond_leave(
+            db,
+            leave_id=leave_id,
+            actor_id=current_user.id,
+            accept=payload.approve,
+            rejection_reason=payload.rejection_reason,
+        )
+    except LeaveConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if row is None:
+        raise HTTPException(404, "Leave request not found.")
+    return row
+
+
+@router.get("/classes/{class_id}/assistants", response_model=list[AssistantRead])
+def list_class_assistants(
+    class_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_class_staff(db, current_user, class_id)
+    return [
+        AssistantRead(id=u.id, name=u.full_name, email=u.email)
+        for u in course_service.list_assistants(db, class_id)
+    ]
+
+
+@router.post("/admin/classes/{class_id}/assistants", response_model=list[AssistantRead])
+def assign_class_assistant(
+    class_id: uuid.UUID,
+    payload: AssistantAssign,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    require_class_staff(db, current_user, class_id)
+    from app.models.course import Enrollment
+
+    target = db.get(User, payload.assistant_id)
+    if not target or target.status != "ACTIVE" or _role_name(target) != "TEACHING_ASSISTANT":
+        raise HTTPException(400, "Select an active teaching assistant.")
+    row = db.query(Enrollment).filter_by(class_id=class_id, student_id=target.id).first()
+    if row:
+        row.status = "ACTIVE"
+    else:
+        db.add(Enrollment(class_id=class_id, student_id=target.id, status="ACTIVE"))
+    db.commit()
+    return list_class_assistants(class_id, db, current_user)
+
+
+@router.delete("/admin/classes/{class_id}/assistants/{assistant_id}", status_code=204)
+def remove_class_assistant(
+    class_id: uuid.UUID,
+    assistant_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+    from app.models.attendance import LeaveRequest
+    from app.models.course import Enrollment
+
+    target = db.get(User, assistant_id)
+    if not target or _role_name(target) != "TEACHING_ASSISTANT":
+        raise HTTPException(400, "This user is not an assistant.")
+    if (
+        db.query(LeaveRequest.id)
+        .filter(
+            LeaveRequest.class_id == class_id,
+            LeaveRequest.target_trainer_id == assistant_id,
+            LeaveRequest.status.in_(("pending", "accepted")),
+            LeaveRequest.date_to >= _today(),
+        )
+        .first()
+    ):
+        raise HTTPException(409, "This assistant is selected for pending or approved leave.")
+    db.query(Enrollment).filter_by(class_id=class_id, student_id=assistant_id).delete()
+    db.commit()

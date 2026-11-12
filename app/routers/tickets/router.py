@@ -59,12 +59,16 @@ def list_tickets(
             page=page,
             page_size=page_size,
         )
-    if role != "TRAINER":
+    if role not in ("TRAINER", "TEACHING_ASSISTANT"):
         raise HTTPException(status_code=403, detail="Only trainers can view the ticket inbox.")
     try:
         items, total = ticket_service.list_trainer_tickets(
-            db, trainer_id=user.id, class_id=class_id, status=status,
-            page=page, page_size=page_size,
+            db,
+            trainer_id=user.id,
+            class_id=class_id,
+            status=status,
+            page=page,
+            page_size=page_size,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -99,12 +103,10 @@ def get_ticket_counts(
     user: User = Depends(get_current_user),
 ) -> TicketCountsResponse:
     """AC-03: open/completed ticket counts for each assigned class."""
-    if role_name_of(user) != "TRAINER":
+    if role_name_of(user) not in ("TRAINER", "TEACHING_ASSISTANT"):
         raise HTTPException(status_code=403, detail="Only trainers can view ticket counts.")
     try:
-        items = ticket_service.ticket_counts_for_trainer(
-            db, trainer_id=user.id, class_id=class_id
-        )
+        items = ticket_service.ticket_counts_for_trainer(db, trainer_id=user.id, class_id=class_id)
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return TicketCountsResponse(
@@ -159,11 +161,14 @@ def get_ticket(
     role = _role(user)
     if role == "ADMIN":
         ticket = ticket_service.get_admin_ticket(db, ticket_id)
+    elif role in ("TRAINER", "TEACHING_ASSISTANT"):
+        try:
+            ticket = ticket_service.get_trainer_ticket(db, ticket_id=ticket_id, trainer_id=user.id)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
     else:
         _require_student(user)
-        ticket = ticket_service.get_student_ticket(
-            db, ticket_id=ticket_id, student_id=user.id
-        )
+        ticket = ticket_service.get_student_ticket(db, ticket_id=ticket_id, student_id=user.id)
     if ticket is None:
         raise HTTPException(status_code=404, detail="Ticket not found.")
     return TicketThreadRead.model_validate(ticket)
@@ -187,7 +192,7 @@ def resolve_ticket(
                 status_code=409, detail="Only an open or answered ticket can be resolved."
             )
         return TicketRead.model_validate(ticket)
-    if role == "TRAINER":
+    if role in ("TRAINER", "TEACHING_ASSISTANT"):
         try:
             existing = ticket_service.get_trainer_ticket(
                 db, ticket_id=ticket_id, trainer_id=user.id
@@ -196,9 +201,7 @@ def resolve_ticket(
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         if existing is None:
             raise HTTPException(status_code=404, detail="Ticket not found.")
-        ticket = ticket_service.resolve_trainer_ticket(
-            db, ticket_id=ticket_id, trainer_id=user.id
-        )
+        ticket = ticket_service.resolve_trainer_ticket(db, ticket_id=ticket_id, trainer_id=user.id)
         if ticket is None:
             raise HTTPException(
                 status_code=409, detail="Only an open or answered ticket can be resolved."
@@ -227,7 +230,7 @@ def reopen_ticket(
     role = _role(user)
     if role == "ADMIN":
         existing = ticket_service.get_admin_ticket(db, ticket_id)
-    elif role == "TRAINER":
+    elif role in ("TRAINER", "TEACHING_ASSISTANT"):
         try:
             existing = ticket_service.get_trainer_ticket(
                 db, ticket_id=ticket_id, trainer_id=user.id
@@ -235,9 +238,7 @@ def reopen_ticket(
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
     elif role == "STUDENT":
-        existing = ticket_service.get_student_ticket(
-            db, ticket_id=ticket_id, student_id=user.id
-        )
+        existing = ticket_service.get_student_ticket(db, ticket_id=ticket_id, student_id=user.id)
     else:
         raise HTTPException(
             status_code=403, detail="Only students and assigned trainers can reopen tickets."
@@ -260,7 +261,10 @@ def add_ticket_reply(
     role = _role(user)
     if role == "ADMIN":
         reply = ticket_service.add_admin_reply(
-            db, ticket_id=ticket_id, admin_id=user.id, message=payload.message,
+            db,
+            ticket_id=ticket_id,
+            admin_id=user.id,
+            message=payload.message,
         )
         if reply is None:
             raise HTTPException(status_code=409, detail="Only open tickets can be answered.")
@@ -274,21 +278,31 @@ def add_ticket_reply(
                 detail="Only open or answered tickets can receive follow-up messages.",
             )
         reply = ticket_service.add_student_reply(
-            db, ticket_id=ticket_id, student_id=user.id, message=payload.message,
+            db,
+            ticket_id=ticket_id,
+            student_id=user.id,
+            message=payload.message,
         )
-    elif role == "TRAINER":
+    elif role in ("TRAINER", "TEACHING_ASSISTANT"):
         try:
             reply = ticket_service.add_trainer_reply(
-                db, ticket_id=ticket_id, trainer_id=user.id, message=payload.message,
+                db,
+                ticket_id=ticket_id,
+                trainer_id=user.id,
+                message=payload.message,
             )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         if reply is None:
             raise HTTPException(status_code=409, detail="Only open tickets can be answered.")
     else:
-        raise HTTPException(status_code=403, detail="Only students and assigned trainers can reply.")
+        raise HTTPException(
+            status_code=403, detail="Only students and assigned trainers can reply."
+        )
     if reply is None:
-        raise HTTPException(status_code=409, detail="Only open tickets can receive follow-up messages.")
+        raise HTTPException(
+            status_code=409, detail="Only open tickets can receive follow-up messages."
+        )
     return TicketReplyRead.model_validate(reply)
 
 
@@ -309,10 +323,12 @@ def assign_ticket(
     if target is None:
         raise HTTPException(status_code=404, detail="Trainer not found.")
     class_trainer_ids = {
-        item["trainer_id"]
-        for item in course_service.list_trainers(db, ticket.class_id)
+        item["trainer_id"] for item in course_service.list_trainers(db, ticket.class_id)
     }
-    if target.id not in class_trainer_ids:
+    class_trainer_ids.update(
+        item.id for item in course_service.list_assistants(db, ticket.class_id)
+    )
+    if target.status != "ACTIVE" or target.id not in class_trainer_ids:
         raise HTTPException(
             status_code=400,
             detail="Target trainer does not teach this class.",

@@ -23,15 +23,13 @@ from app.models.course import Class, ClassTrainer
 from app.models.ticket import Ticket, TicketReply
 from app.models.user import User
 from app.services.availability_service import available_trainers
-from app.services.course_service import DomainError, class_ids_for_trainer
+from app.services.course_service import DomainError, class_ids_for_trainer, list_assistants
 from app.services.holiday_service import HolidayBlocked, ensure_working_day, local_date
 
 ASSIGNABLE_TICKET_STATUSES = ("OPEN", "ANSWERED")
 TRANSFER_REPLY = "Ticket transferred from {from_name} to {to_name} ({reason})."
 QUEUE_REPLY = "All trainers are off today; the ticket is waiting for an administrator."
-REJECT_REPLY = (
-    "Handover from {from_name} was rejected; the ticket returns to the automatic queue."
-)
+REJECT_REPLY = "Handover from {from_name} was rejected; the ticket returns to the automatic queue."
 
 
 class HandoverConflictError(DomainError):
@@ -64,10 +62,32 @@ def pick_replacement(
     user id so the result is deterministic.
     """
     excluded = set(exclude_ids)
+    # A chosen assistant takes priority only for this absent owner and class.
+    preferred = (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.status == "accepted",
+            LeaveRequest.class_id == class_id,
+            LeaveRequest.trainer_id.in_(excluded),
+            LeaveRequest.date_from <= day,
+            LeaveRequest.date_to >= day,
+            LeaveRequest.target_trainer_id.isnot(None),
+        )
+        .order_by(LeaveRequest.created_at.desc())
+        .first()
+    )
+    if preferred:
+        from app.services.availability_service import is_available
+
+        for assistant in list_assistants(db, class_id):
+            if (
+                assistant.id == preferred.target_trainer_id
+                and assistant.id not in excluded
+                and is_available(db, assistant.id, day)
+            ):
+                return assistant
     candidates = [
-        trainer
-        for trainer in available_trainers(db, class_id, day)
-        if trainer.id not in excluded
+        trainer for trainer in available_trainers(db, class_id, day) if trainer.id not in excluded
     ]
     if not candidates:
         return None
@@ -88,7 +108,8 @@ def pick_replacement(
                 LeaveRequest.status == "accepted",
                 LeaveRequest.date_from <= day,
                 LeaveRequest.date_to >= day,
-                LeaveRequest.trainer_id.in_(class_trainer_ids),
+                LeaveRequest.trainer_id.in_(excluded),
+                LeaveRequest.class_id.is_(None),
                 LeaveRequest.target_trainer_id.in_(candidate_ids),
             )
             .order_by(LeaveRequest.created_at.desc(), LeaveRequest.id.desc())
@@ -182,14 +203,35 @@ def assign(
         raise DomainError("Ticket already belongs to this trainer.")
 
     now = datetime.now(UTC)
-    try:
-        handover = _apply_assign(db, ticket, to, reason, actor_id, status, now)
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        db.refresh(ticket)
-        handover = _apply_assign(db, ticket, to, reason, actor_id, status, now)
-        db.commit()
+    expected_owner = ticket.owner_trainer_id
+    for attempt in range(2):
+        try:
+            if status == "accepted":
+                claimed = db.execute(
+                    update(Ticket)
+                    .where(
+                        Ticket.id == ticket.id,
+                        Ticket.owner_trainer_id == expected_owner,
+                        Ticket.status.in_(ASSIGNABLE_TICKET_STATUSES),
+                    )
+                    .values(owner_trainer_id=to.id)
+                    .execution_options(synchronize_session=False)
+                )
+                if not claimed.rowcount:
+                    db.rollback()
+                    raise HandoverConflictError(
+                        "Ticket ownership changed; refresh before transferring."
+                    )
+            handover = _apply_assign(db, ticket, to, reason, actor_id, status, now)
+            db.commit()
+            break
+        except IntegrityError:
+            db.rollback()
+            db.refresh(ticket)
+            if attempt or ticket.owner_trainer_id != expected_owner:
+                raise HandoverConflictError(
+                    "Ticket ownership changed; refresh before transferring."
+                )
 
     db.refresh(handover)
     return handover
@@ -204,7 +246,22 @@ def queue_for_admin(
     """Mark a ticket as waiting for an administrator, keeping its owner."""
     if ticket.queued_for_admin_at is not None:
         return
-    ticket.queued_for_admin_at = now or datetime.now(UTC)
+    queued_at = now or datetime.now(UTC)
+    claimed = db.execute(
+        update(Ticket)
+        .where(
+            Ticket.id == ticket.id,
+            Ticket.owner_trainer_id == ticket.owner_trainer_id,
+            Ticket.queued_for_admin_at.is_(None),
+            Ticket.status.in_(ASSIGNABLE_TICKET_STATUSES),
+        )
+        .values(queued_for_admin_at=queued_at)
+        .execution_options(synchronize_session=False)
+    )
+    if not claimed.rowcount:
+        db.rollback()
+        return
+    ticket.queued_for_admin_at = queued_at
     author_id = ticket.owner_trainer_id or actor_id
     if author_id is not None:
         db.add(
@@ -247,28 +304,22 @@ def sweep_for_trainer(
             .filter(
                 Ticket.class_id == class_id,
                 Ticket.owner_trainer_id == trainer_id,
-                Ticket.status == "OPEN",
+                Ticket.status.in_(ASSIGNABLE_TICKET_STATUSES),
             )
             .order_by(Ticket.created_at.asc(), Ticket.id.asc())
             .all()
         )
         for ticket in tickets:
-            if ticket.queued_for_admin_at is not None:
-                continue
-            replacement = pick_replacement(
-                db, class_id, day, {trainer_id} | extra_exclusions
-            )
+            replacement = pick_replacement(db, class_id, day, {trainer_id} | extra_exclusions)
             if replacement is None:
+                if ticket.queued_for_admin_at is not None:
+                    continue
                 queue_for_admin(db, ticket, actor_id=trainer_id)
             else:
-                assign(
-                    db,
-                    ticket,
-                    replacement,
-                    "auto_absent",
-                    trainer_id,
-                    status="accepted",
-                )
+                try:
+                    assign(db, ticket, replacement, "auto_absent", trainer_id, status="accepted")
+                except HandoverConflictError:
+                    continue
             handled += 1
     return handled
 
@@ -294,9 +345,7 @@ def clear_queue_for(
     return result.rowcount or 0
 
 
-def pending_handovers_for(
-    db: Session, trainer_id: uuid.UUID
-) -> list[TicketHandover]:
+def pending_handovers_for(db: Session, trainer_id: uuid.UUID) -> list[TicketHandover]:
     """Return pending handovers addressed to a trainer, oldest first."""
     return (
         db.query(TicketHandover)
@@ -309,12 +358,8 @@ def pending_handovers_for(
     )
 
 
-def _pending_handover(
-    db: Session, handover_id: uuid.UUID, actor_id: uuid.UUID
-) -> TicketHandover:
-    handover = (
-        db.query(TicketHandover).filter(TicketHandover.id == handover_id).first()
-    )
+def _pending_handover(db: Session, handover_id: uuid.UUID, actor_id: uuid.UUID) -> TicketHandover:
+    handover = db.query(TicketHandover).filter(TicketHandover.id == handover_id).first()
     if handover is None:
         raise LookupError("Handover not found.")
     if handover.to_trainer_id != actor_id:
@@ -324,9 +369,7 @@ def _pending_handover(
     return handover
 
 
-def accept_handover(
-    db: Session, handover_id: uuid.UUID, actor_id: uuid.UUID
-) -> TicketHandover:
+def accept_handover(db: Session, handover_id: uuid.UUID, actor_id: uuid.UUID) -> TicketHandover:
     """Accept a pending handover and make the recipient the ticket owner."""
     handover = _pending_handover(db, handover_id, actor_id)
     ticket = handover.ticket
@@ -351,9 +394,7 @@ def accept_handover(
     return handover
 
 
-def reject_handover(
-    db: Session, handover_id: uuid.UUID, actor_id: uuid.UUID
-) -> TicketHandover:
+def reject_handover(db: Session, handover_id: uuid.UUID, actor_id: uuid.UUID) -> TicketHandover:
     """Reject a pending handover and immediately run the automatic sweep."""
     handover = _pending_handover(db, handover_id, actor_id)
     ticket = handover.ticket
@@ -364,9 +405,7 @@ def reject_handover(
         TicketReply(
             ticket_id=ticket.id,
             user_id=handover.from_trainer_id,
-            message=REJECT_REPLY.format(
-                from_name=handover.from_trainer_name or "Unknown"
-            ),
+            message=REJECT_REPLY.format(from_name=handover.from_trainer_name or "Unknown"),
         )
     )
     db.commit()

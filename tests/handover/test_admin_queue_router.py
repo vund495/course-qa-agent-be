@@ -74,7 +74,7 @@ def test_admin_queue_permissions_and_payload(
     res = handover_client.get("/api/admin/tickets/queue", headers=admin)
     assert res.status_code == 200
     body = res.json()
-    assert len(body) == 1
+    assert len(body) == 2
     assert body[0]["id"] == str(queued.id)
     assert body[0]["owner_trainer_name"] == "Primary Trainer"
     assert body[0]["absent_trainers"] == ["Co Trainer"]
@@ -82,7 +82,7 @@ def test_admin_queue_permissions_and_payload(
 
     res = handover_client.get("/api/tickets", headers=admin)
     assert res.status_code == 200
-    assert res.json()["total"] == 1
+    assert res.json()["total"] == 2
     assert res.json()["items"][0]["id"] == str(queued.id)
 
 

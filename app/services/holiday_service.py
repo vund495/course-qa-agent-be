@@ -218,8 +218,11 @@ def seed_holidays(
     else:
         target = {int(year) for year in years}
 
-    created = sum(ensure_year_holidays(db, year) for year in sorted(target))
-    _write_seed_marker(db, max(target))
+    if not target:
+        return 0
+    pending = [year for year in sorted(target) if marker is None or year > marker]
+    created = sum(ensure_year_holidays(db, year) for year in pending)
+    _write_seed_marker(db, max(max(target), marker or 0))
     db.commit()
     return created
 
