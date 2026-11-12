@@ -76,16 +76,40 @@ class HandoverRead(BaseModel):
     responded_at: datetime | None = None
 
 
+LeaveReasonType = Literal["annual_leave", "sick_leave", "wedding_leave", "bereavement_leave", "maternity_paternity", "family_care", "business_trip", "training_leave", "civic_duty", "personal_leave", "other"]
+
+
+class LeaveRequestReview(BaseModel):
+    approve: bool
+    rejection_reason: str | None = Field(default=None, max_length=1000)
+
+
+class AssistantAssign(BaseModel):
+    assistant_id: uuid.UUID
+
+
+class AssistantRead(BaseModel):
+    id: uuid.UUID
+    name: str
+    email: str
+
+
 class LeaveRequestCreate(BaseModel):
+    class_id: uuid.UUID
+    reason_type: LeaveReasonType
+    reason_details: str | None = Field(default=None, max_length=1000)
     date_from: date_type
     date_to: date_type
-    target_trainer_id: uuid.UUID
+    target_trainer_id: uuid.UUID | None = None
     reason: str | None = Field(default=None, max_length=1000)
 
     @model_validator(mode="after")
     def validate_dates(self) -> LeaveRequestCreate:
         if self.date_from > self.date_to:
             raise ValueError("date_from must be on or before date_to.")
+        self.reason_details = (self.reason_details or "").strip() or None
+        if self.reason_type == "other" and not self.reason_details:
+            raise ValueError("Details are required for other leave reasons.")
         return self
 
     @field_validator("reason")
@@ -97,6 +121,11 @@ class LeaveRequestCreate(BaseModel):
 
 
 class LeaveRequestRead(BaseModel):
+    class_name: str | None = None
+    class_id: uuid.UUID | None = None
+    reason_type: str = "other"
+    reason_details: str | None = None
+    rejection_reason: str | None = None
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -104,7 +133,7 @@ class LeaveRequestRead(BaseModel):
     trainer_name: str | None = None
     date_from: date_type
     date_to: date_type
-    target_trainer_id: uuid.UUID
+    target_trainer_id: uuid.UUID | None = None
     target_trainer_name: str | None = None
     reason: str | None = None
     status: LeaveRequestStatus

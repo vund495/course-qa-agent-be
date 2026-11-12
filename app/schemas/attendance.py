@@ -50,7 +50,28 @@ class ClassScheduleRead(BaseModel):
     effective_to: date | None
 
 
-class ClassSessionRead(BaseModel):
+class SessionTrainerLeaveRead(BaseModel):
+    """Approved leave affecting a dated session."""
+
+    id: uuid.UUID
+    date_from: date
+    date_to: date
+    reason_type: str | None = None
+    reason_details: str | None = None
+    target_trainer_id: uuid.UUID | None = None
+    target_trainer_name: str | None = None
+
+
+class SessionCalendarFlags(BaseModel):
+    """Live calendar warnings; these do not alter persisted session status."""
+
+    is_holiday: bool = False
+    holiday_name: str | None = None
+    trainer_on_leave: bool = False
+    trainer_leave: SessionTrainerLeaveRead | None = None
+
+
+class ClassSessionRead(SessionCalendarFlags):
     """Response DTO representing a materialised dated class session."""
 
     model_config = ConfigDict(from_attributes=True)
@@ -185,7 +206,7 @@ class StudentAttendanceRead(BaseModel):
     items: list[StudentAttendanceItem]
 
 
-class StudentScheduleSessionRead(BaseModel):
+class StudentScheduleSessionRead(SessionCalendarFlags):
     """One dated class session as seen by an enrolled student (AI-157)."""
 
     id: uuid.UUID

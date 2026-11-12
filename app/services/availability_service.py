@@ -2,8 +2,8 @@
 
 The day status is intentionally small: ``present`` is the implicit default and
 ``off`` removes a trainer from auto-handover candidates. Planned leave is
-stored separately in ``leave_request``; when a leave request is accepted, the
-leave service writes ``off`` rows here for every covered day.
+stored separately in ``leave_request``; accepted requests are evaluated as an
+effective ``off`` status without duplicating rows in ``trainer_day_status``.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from datetime import date
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.attendance import TRAINER_DAY_STATUSES, TrainerDayStatus
+from app.models.attendance import TRAINER_DAY_STATUSES, LeaveRequest, TrainerDayStatus
 from app.models.course import Class, ClassTrainer
 from app.models.user import User
 from app.services.course_service import DomainError
@@ -28,6 +28,18 @@ def get_day_status(db: Session, trainer_id: uuid.UUID, day: date) -> str:
     Missing rows mean the trainer has not marked anything, which is treated as
     available (``present``).
     """
+    approved = (
+        db.query(LeaveRequest.id)
+        .filter(
+            LeaveRequest.trainer_id == trainer_id,
+            LeaveRequest.status == "accepted",
+            LeaveRequest.date_from <= day,
+            LeaveRequest.date_to >= day,
+        )
+        .first()
+    )
+    if approved:
+        return "off"
     status = (
         db.query(TrainerDayStatus.status)
         .filter(
@@ -54,6 +66,20 @@ def set_day_status(
     updates the winning row instead of failing the request. Marking ``off``
     sweeps open tickets; marking ``present`` clears this trainer's admin queue.
     """
+    if (
+        status == "present"
+        and db.query(LeaveRequest.id)
+        .filter(
+            LeaveRequest.trainer_id == trainer_id,
+            LeaveRequest.status == "accepted",
+            LeaveRequest.date_from <= day,
+            LeaveRequest.date_to >= day,
+        )
+        .first()
+    ):
+        raise DomainError(
+            "Approved leave covers this day; contact an administrator before marking present."
+        )
     if status not in TRAINER_DAY_STATUSES:
         raise DomainError(f"Status must be one of: {', '.join(TRAINER_DAY_STATUSES)}.")
 
@@ -159,4 +185,10 @@ def available_trainers(
         )
         .all()
     }
-    return [trainer for trainer in users.values() if trainer.id not in off_ids]
+    return [
+        trainer
+        for trainer in users.values()
+        if trainer.status == "ACTIVE"
+        and trainer.id not in off_ids
+        and is_available(db, trainer.id, day)
+    ]

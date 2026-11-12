@@ -15,6 +15,7 @@ from app.core.database import get_session_local, init_engine
 from app.core.deps import get_db
 from app.core.logging import configure_logging
 from app.core.seed import seed_database
+from app.routers import holidays
 from app.routers.admin.router import router as admin_router
 from app.routers.attendance import (
     router as attendance_router,
@@ -88,6 +89,8 @@ def _expire_tickets_once() -> int:
 
     session_local = get_session_local(settings.database_url)
     with session_local() as db:
+        from app.services.leave_service import activate_approved_leaves
+        activate_approved_leaves(db)
         return expire_open_tickets(db)
 
 
@@ -164,3 +167,6 @@ def health_check(db: Session = Depends(get_db)):
     """
 
     return build_health(db, settings, live_llm=False)
+
+
+app.include_router(holidays.router, prefix="/api")

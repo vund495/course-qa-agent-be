@@ -13,12 +13,13 @@ import logging
 import uuid
 from datetime import date, datetime
 
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.attendance import Attendance, ClassSchedule, ClassSession
 from app.models.course import Class, ClassInfo, Enrollment
-from app.models.user import User
+from app.models.user import Role, User
 from app.schemas.attendance import (
     AttendanceCounts,
     AttendanceRecordRead,
@@ -78,7 +79,12 @@ def get_sheet(
     roster = (
         db.query(User)
         .join(Enrollment, Enrollment.student_id == User.id)
-        .filter(Enrollment.class_id == clazz.id, Enrollment.status == "ACTIVE")
+        .join(Role, User.role_id == Role.id)
+        .filter(
+            Enrollment.class_id == clazz.id,
+            Enrollment.status == "ACTIVE",
+            func.upper(Role.name) == "STUDENT",
+        )
         .order_by(User.student_code.asc(), User.full_name.asc())
         .all()
     )
@@ -88,7 +94,7 @@ def get_sheet(
         db.query(Attendance)
         .filter(
             Attendance.class_session_id == session.id,
-            Attendance.student_id.isnot(None),
+            Attendance.student_id.in_([student.id for student in roster]),
         )
         .all()
     )
@@ -158,6 +164,7 @@ def get_sheet(
         note=session.note,
         student_count=len(roster),
         marked_count=len(attendance_rows),
+        **schedule_service.session_calendar_flags(db, clazz, [session])[session.id],
     )
 
     return AttendanceSheetRead(
@@ -208,7 +215,13 @@ def save_sheet(
     # Validate all student IDs belong to active class roster
     active_enrollments = (
         db.query(Enrollment.student_id)
-        .filter(Enrollment.class_id == clazz.id, Enrollment.status == "ACTIVE")
+        .join(User, Enrollment.student_id == User.id)
+        .join(Role, User.role_id == Role.id)
+        .filter(
+            Enrollment.class_id == clazz.id,
+            Enrollment.status == "ACTIVE",
+            func.upper(Role.name) == "STUDENT",
+        )
         .all()
     )
     active_student_ids = {row[0] for row in active_enrollments}
@@ -309,7 +322,12 @@ def get_summary(
     students = (
         db.query(User)
         .join(Enrollment, Enrollment.student_id == User.id)
-        .filter(Enrollment.class_id == clazz.id, Enrollment.status == "ACTIVE")
+        .join(Role, User.role_id == Role.id)
+        .filter(
+            Enrollment.class_id == clazz.id,
+            Enrollment.status == "ACTIVE",
+            func.upper(Role.name) == "STUDENT",
+        )
         .order_by(User.student_code.asc(), User.full_name.asc())
         .all()
     )
@@ -387,7 +405,10 @@ def get_student_history(
     """
     is_active = (
         db.query(Enrollment)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Role, User.role_id == Role.id)
         .filter(
+            func.upper(Role.name) == "STUDENT",
             Enrollment.class_id == clazz.id,
             Enrollment.student_id == student_id,
             Enrollment.status == "ACTIVE",
@@ -509,7 +530,10 @@ def get_student_schedule(
     """
     is_active = (
         db.query(Enrollment)
+        .join(User, Enrollment.student_id == User.id)
+        .join(Role, User.role_id == Role.id)
         .filter(
+            func.upper(Role.name) == "STUDENT",
             Enrollment.class_id == clazz.id,
             Enrollment.student_id == student_id,
             Enrollment.status == "ACTIVE",
@@ -573,6 +597,7 @@ def get_student_schedule(
 
     class_info = db.query(ClassInfo).filter(ClassInfo.class_id == clazz.id).first()
 
+    calendar_flags = schedule_service.session_calendar_flags(db, clazz, sessions)
     session_items: list[StudentScheduleSessionRead] = []
     for session in sessions:
         attendance = attendance_map.get(session.id)
@@ -587,6 +612,7 @@ def get_student_schedule(
                 status=session.status,
                 attendance_status=attendance.status if attendance else None,
                 attendance_note=attendance.note if attendance else None,
+                **calendar_flags[session.id],
             )
         )
 

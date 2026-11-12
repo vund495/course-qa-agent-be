@@ -29,6 +29,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 if TYPE_CHECKING:
+    from app.models.course import Class
     from app.models.ticket import Ticket
     from app.models.user import User
 
@@ -228,9 +229,17 @@ class LeaveRequest(Base):
     )
     date_from: Mapped[dt.date] = mapped_column(Date, nullable=False)
     date_to: Mapped[dt.date] = mapped_column(Date, nullable=False)
-    target_trainer_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid, ForeignKey("user.id", ondelete="RESTRICT"), nullable=False
+    target_trainer_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("user.id", ondelete="RESTRICT"), nullable=True
     )
+    class_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("class.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    reason_type: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="other", server_default="other"
+    )
+    reason_details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending", server_default="pending"
@@ -238,16 +247,18 @@ class LeaveRequest(Base):
     responded_by: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
-    responded_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    responded_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
 
-    trainer: Mapped["User"] = relationship(
-        "User", foreign_keys=[trainer_id], lazy="joined"
-    )
+    clazz: Mapped["Class | None"] = relationship("Class", foreign_keys=[class_id], lazy="joined")
+
+    @property
+    def class_name(self) -> str | None:
+        return self.clazz.name if self.clazz is not None else None
+
+    trainer: Mapped["User"] = relationship("User", foreign_keys=[trainer_id], lazy="joined")
     target_trainer: Mapped["User"] = relationship(
         "User", foreign_keys=[target_trainer_id], lazy="joined"
     )
@@ -269,8 +280,7 @@ class Holiday(Base):
         CheckConstraint("type IN ('solar', 'lunar', 'admin')", name="ck_holiday_type"),
         CheckConstraint("scope IN ('system', 'class')", name="ck_holiday_scope"),
         CheckConstraint(
-            "(scope = 'class' AND class_id IS NOT NULL)"
-            " OR (scope = 'system' AND class_id IS NULL)",
+            "(scope = 'class' AND class_id IS NOT NULL) OR (scope = 'system' AND class_id IS NULL)",
             name="ck_holiday_scope_class",
         ),
         Index(
@@ -353,9 +363,7 @@ class TicketHandover(Base):
     from_trainer: Mapped["User"] = relationship(
         "User", foreign_keys=[from_trainer_id], lazy="joined"
     )
-    to_trainer: Mapped["User"] = relationship(
-        "User", foreign_keys=[to_trainer_id], lazy="joined"
-    )
+    to_trainer: Mapped["User"] = relationship("User", foreign_keys=[to_trainer_id], lazy="joined")
 
     @property
     def ticket_question(self) -> str | None:

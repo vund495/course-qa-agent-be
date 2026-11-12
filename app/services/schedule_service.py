@@ -18,14 +18,16 @@ from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.attendance import Attendance, ClassSchedule, ClassSession
+from app.models.attendance import Attendance, ClassSchedule, ClassSession, LeaveRequest
 from app.models.course import Class, ClassTrainer, Enrollment
-from app.models.user import User
+from app.models.user import Role, User
 from app.schemas.attendance import (
     ClassScheduleCreate,
     ClassScheduleRead,
     ClassSessionRead,
+    SessionCalendarFlags,
     SessionCreate,
+    SessionTrainerLeaveRead,
 )
 from app.services.course_service import DomainError
 from app.services.holiday_service import (
@@ -33,6 +35,7 @@ from app.services.holiday_service import (
     HolidayBlocked,
     get_holiday,
     holiday_dates,
+    holidays_between,
     is_holiday,
     local_date,
 )
@@ -329,6 +332,65 @@ def generate_sessions(
     )
 
 
+def session_calendar_flags(
+    db: Session,
+    clazz: Class,
+    sessions: list[ClassSession],
+) -> dict[uuid.UUID, dict]:
+    """Batch-load holiday and approved leave warnings for session responses."""
+    if not sessions:
+        return {}
+    date_from = min(session.date for session in sessions)
+    date_to = max(session.date for session in sessions)
+    holiday_map = {}
+    for holiday in holidays_between(db, date_from, date_to, clazz.id):
+        if holiday.date not in holiday_map or holiday.scope == "class":
+            holiday_map[holiday.date] = holiday
+
+    leaves = (
+        db.query(LeaveRequest)
+        .filter(
+            LeaveRequest.trainer_id.in_({session.trainer_id for session in sessions}),
+            LeaveRequest.status == "accepted",
+            LeaveRequest.date_from <= date_to,
+            LeaveRequest.date_to >= date_from,
+            or_(LeaveRequest.class_id == clazz.id, LeaveRequest.class_id.is_(None)),
+        )
+        .order_by(LeaveRequest.class_id.is_(None), LeaveRequest.created_at.desc(), LeaveRequest.id)
+        .all()
+    )
+    result = {}
+    for session in sessions:
+        holiday = holiday_map.get(session.date)
+        leave = next(
+            (
+                row
+                for row in leaves
+                if row.trainer_id == session.trainer_id
+                and row.date_from <= session.date <= row.date_to
+            ),
+            None,
+        )
+        details = None
+        if leave is not None:
+            details = SessionTrainerLeaveRead(
+                id=leave.id,
+                date_from=leave.date_from,
+                date_to=leave.date_to,
+                reason_type=leave.reason_type,
+                reason_details=leave.reason_details or leave.reason,
+                target_trainer_id=leave.target_trainer_id,
+                target_trainer_name=leave.target_trainer_name,
+            )
+        result[session.id] = SessionCalendarFlags(
+            is_holiday=holiday is not None,
+            holiday_name=holiday.name if holiday else None,
+            trainer_on_leave=leave is not None,
+            trainer_leave=details,
+        ).model_dump()
+    return result
+
+
 def list_sessions(
     db: Session,
     clazz: Class,
@@ -345,7 +407,13 @@ def list_sessions(
     # Active enrolled student count in this class
     active_students_count = (
         db.query(func.count(Enrollment.id))
-        .filter(Enrollment.class_id == clazz.id, Enrollment.status == "ACTIVE")
+        .join(User, Enrollment.student_id == User.id)
+        .join(Role, User.role_id == Role.id)
+        .filter(
+            Enrollment.class_id == clazz.id,
+            Enrollment.status == "ACTIVE",
+            func.upper(Role.name) == "STUDENT",
+        )
         .scalar()
         or 0
     )
@@ -356,7 +424,10 @@ def list_sessions(
             Attendance.class_session_id,
             func.count(Attendance.id).label("marked_count"),
         )
+        .join(User, Attendance.student_id == User.id)
+        .join(Role, User.role_id == Role.id)
         .filter(
+            func.upper(Role.name) == "STUDENT",
             Attendance.class_session_id.in_(session_ids),
             Attendance.student_id.isnot(None),
         )
@@ -372,6 +443,7 @@ def list_sessions(
     trainers = db.query(User.id, User.full_name).filter(User.id.in_(trainer_ids)).all()
     trainer_name_map: dict[uuid.UUID, str] = {t.id: t.full_name for t in trainers}
 
+    calendar_flags = session_calendar_flags(db, clazz, sessions)
     result: list[ClassSessionRead] = []
     for s in sessions:
         dto = ClassSessionRead(
@@ -387,6 +459,7 @@ def list_sessions(
             note=s.note,
             student_count=active_students_count,
             marked_count=marked_map.get(s.id, 0),
+            **calendar_flags[s.id],
         )
         result.append(dto)
     return result
@@ -451,7 +524,13 @@ def create_ad_hoc_session(
     # Active student count
     active_students_count = (
         db.query(func.count(Enrollment.id))
-        .filter(Enrollment.class_id == clazz.id, Enrollment.status == "ACTIVE")
+        .join(User, Enrollment.student_id == User.id)
+        .join(Role, User.role_id == Role.id)
+        .filter(
+            Enrollment.class_id == clazz.id,
+            Enrollment.status == "ACTIVE",
+            func.upper(Role.name) == "STUDENT",
+        )
         .scalar()
         or 0
     )
@@ -472,4 +551,5 @@ def create_ad_hoc_session(
         note=session.note,
         student_count=active_students_count,
         marked_count=0,
+        **session_calendar_flags(db, clazz, [session])[session.id],
     )

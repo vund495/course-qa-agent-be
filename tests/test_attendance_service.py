@@ -652,3 +652,83 @@ def test_student_schedule_rejects_non_enrolled_student(db_session):
         attendance_service.get_student_schedule(
             db_session, clazz, student.id, date(2026, 11, 1), date(2026, 11, 10)
         )
+
+
+@pytest.fixture()
+def assistant_roster(db_session):
+    trainer = _make_user(db_session, "trainer@assistant-roster.test", role_name="TRAINER")
+    student = _make_user(db_session, "student@assistant-roster.test", role_name="STUDENT")
+    assistant = _make_user(
+        db_session, "assistant@assistant-roster.test", role_name="TEACHING_ASSISTANT"
+    )
+    clazz = _make_class(db_session, trainer, code="ASSISTANT-ROSTER")
+    day = date(2026, 11, 12)
+    session = _make_session(db_session, clazz, day, trainer)
+    db_session.add_all(
+        [
+            Enrollment(class_id=clazz.id, student_id=user.id, status="ACTIVE")
+            for user in (student, assistant)
+        ]
+    )
+    db_session.add(
+        Attendance(
+            class_session_id=session.id,
+            student_id=assistant.id,
+            status="present",
+            recorded_by=trainer.id,
+        )
+    )
+    db_session.commit()
+    return clazz, trainer, student, assistant, session, day
+
+
+def test_attendance_sheet_excludes_enrolled_assistant_and_old_marks(db_session, assistant_roster):
+    clazz, _, student, _, session, _ = assistant_roster
+    sheet = attendance_service.get_sheet(db_session, clazz, session.id)
+    assert [record.student_id for record in sheet.records] == [student.id]
+    assert sheet.session.student_count == 1
+    assert sheet.session.marked_count == 0
+    assert sheet.summary.present == 0
+    assert sheet.summary.unmarked == 1
+
+
+def test_attendance_summary_excludes_enrolled_assistant(db_session, assistant_roster):
+    clazz, _, student, _, _, day = assistant_roster
+    summary = attendance_service.get_summary(db_session, clazz, day, day, today=day)
+    assert [row.student_id for row in summary.students] == [student.id]
+
+
+def test_attendance_save_rejects_enrolled_assistant(db_session, assistant_roster):
+    clazz, trainer, _, assistant, session, day = assistant_roster
+    with pytest.raises(StudentNotInRosterError):
+        attendance_service.save_sheet(
+            db_session,
+            clazz,
+            session.id,
+            [AttendanceRecordUpdate(student_id=assistant.id, status="late")],
+            trainer.id,
+            today=day,
+        )
+
+
+def test_schedule_counts_exclude_assistant_enrollment_and_old_marks(db_session, assistant_roster):
+    from app.schemas.attendance import SessionCreate
+    from app.services import schedule_service
+
+    clazz, trainer, _, _, _, day = assistant_roster
+    sessions = schedule_service.list_sessions(db_session, clazz, day, day)
+    assert sessions[0].student_count == 1
+    assert sessions[0].marked_count == 0
+    created = schedule_service.create_ad_hoc_session(
+        db_session, clazz, SessionCreate(date=day, start_time=time(13), end_time=time(15)), trainer
+    )
+    assert created.student_count == 1
+
+
+@pytest.mark.parametrize(
+    "fetch", [attendance_service.get_student_history, attendance_service.get_student_schedule]
+)
+def test_student_attendance_views_reject_enrolled_assistant(db_session, assistant_roster, fetch):
+    clazz, _, _, assistant, _, day = assistant_roster
+    with pytest.raises(StudentNotInRosterError):
+        fetch(db_session, clazz, assistant.id, day, day, today=day)

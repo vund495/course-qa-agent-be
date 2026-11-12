@@ -139,10 +139,10 @@ def _member_class_ids(db: Session, user: User) -> set[uuid.UUID] | None:
     role = _role_name(db, user).upper()
     if role == "ADMIN":
         return None
-    if role == "TRAINER":
-        from app.services.course_service import class_ids_for_trainer
+    if role in ("TRAINER", "TEACHING_ASSISTANT"):
+        from app.services.course_service import class_ids_for_ticket_staff
 
-        return class_ids_for_trainer(db, user.id, active_only=True)
+        return class_ids_for_ticket_staff(db, user.id, active_only=True)
     rows = (
         db.query(Enrollment.class_id)
         .join(Class, Enrollment.class_id == Class.id)
