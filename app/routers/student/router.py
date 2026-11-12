@@ -279,9 +279,18 @@ def class_documents(
 ):
     """Approved (indexed) materials of one class for its members (syllabus tab)."""
     section = _require_member(db, user, _coerce_uuid(class_id))
+    from app.services import document_service
+
+    allowed_ids = document_service.retrievable_document_ids(db, section.id)
+    if not allowed_ids:
+        return []
     rows = (
         db.query(Document)
-        .filter(Document.class_id == section.id, Document.status == "indexed")
+        .filter(
+            Document.class_id == section.id,
+            Document.status == "indexed",
+            Document.id.in_([uuid.UUID(part) for part in allowed_ids]),
+        )
         .order_by(Document.created_at.desc())
         .all()
     )
