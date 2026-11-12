@@ -5,6 +5,7 @@ via ``app.core.deps.require_trainer``. Identity is the DB ``User`` row;
 class scope resolves from ``course``/``class`` tables.
 """
 
+import uuid
 from pathlib import Path
 
 from fastapi import (
@@ -23,18 +24,27 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_db, require_trainer
 from app.models.course import Class
 from app.models.document import Document
-from app.models.user import User
+from app.models.user import Role, User
 from app.schemas.documents import (
     AcceptedTypeRead,
+    AttachSyllabusMaterialRequest,
     ClassMineRead,
     DocumentDeleteResponse,
     DocumentListResponse,
     DocumentRead,
     DocumentUploadResponse,
     DocumentUploadResult,
+    SyllabusMaterialRead,
+    TeacherSyllabusRead,
+    TeacherSyllabusUnitRead,
 )
 from app.services import document_service, document_validation_service, ingestion_service
 from app.services.document_service import ACCEPTED_EXTENSIONS, VALID_STATUSES
+from app.services.ingestion.syllabus_parser import (
+    SyllabusFormatError,
+    is_syllabus_document,
+    parse_syllabus_markdown,
+)
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -45,6 +55,18 @@ def _require_uploader(record: Document, user: User) -> None:
             status_code=403,
             detail="Only the uploader can manage this document.",
         )
+
+
+def _role_name(db: Session, user: User) -> str:
+    role = getattr(user, "role", None)
+    if role is not None and getattr(role, "name", None):
+        return role.name
+    role = db.get(Role, user.role_id)
+    return role.name if role is not None else ""
+
+
+def _is_trainer(db: Session, user: User) -> bool:
+    return _role_name(db, user).upper() == "TRAINER"
 
 
 def _scoped_document(db: Session, document_id: str, user: User) -> Document:
@@ -84,6 +106,10 @@ def _record_to_read(db: Session, record: Document) -> DocumentRead:
         failure_reason=record.failure_reason,
         version=record.version,
         created_at=record.created_at,
+        syllabus_document_id=(
+            str(record.syllabus_document_id) if record.syllabus_document_id else None
+        ),
+        syllabus_unit_number=record.syllabus_unit_number,
     )
 
 
@@ -119,6 +145,8 @@ def classes_mine(
 async def upload_documents(
     files: list[UploadFile] = File(...),
     class_id: str = Form(...),
+    syllabus_document_id: str | None = Form(default=None),
+    unit_number: int | None = Form(default=None),
     force: bool = Query(default=False),
     user: User = Depends(require_trainer),
     db: Session = Depends(get_db),
@@ -127,28 +155,84 @@ async def upload_documents(
 
     AI-39 AC-03: a repeated file name creates a pending next version; the
     prior version stays active until the replacement is approved and indexed.
+
+    AI-166: optional ``syllabus_document_id`` + ``unit_number`` attach the
+    material to one unit of a draft or approved syllabus in the same class.
     """
-    results: list[DocumentUploadResult] = []
+    if unit_number is not None and syllabus_document_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="unit_number requires syllabus_document_id.",
+        )
+    try:
+        class_uuid = uuid.UUID(class_id)
+    except (TypeError, ValueError, AttributeError):
+        class_uuid = None
+
+    target: Document | None = None
+    target_error: str | None = None
+    if syllabus_document_id is not None:
+        if class_uuid is None:
+            target_error = "Class does not exist."
+        else:
+            resolved = document_service.validate_material_target(
+                db,
+                class_id=class_uuid,
+                syllabus_document_id=syllabus_document_id,
+                unit_number=unit_number,
+                user=user,
+            )
+            if isinstance(resolved, str):
+                target_error = resolved
+            else:
+                target = resolved
+
+    # Product policy: trainers own the class topic and take responsibility for
+    # the material they upload, so the AI relevance gate is admin-only. File
+    # type/size/content, class ownership, and syllabus parsing stay enforced.
+    skip_relevance_gate = _is_trainer(db, user)
+
+    # Phase 1: create/parse every file first. The syllabus context must be
+    # resolved after the whole batch exists, otherwise a material ordered
+    # before its new syllabus would bind to NULL or a stale active syllabus.
+    prepared: list[dict] = []
+    batch_syllabi: list[Document] = []
     for upload in files:
         content = await upload.read()
         name = upload.filename or "unnamed"
+        if target_error is not None:
+            prepared.append({"name": name, "error": target_error})
+            continue
         try:
             record = document_service.create_document(db, name, content, class_id, user)
         except ValueError as exc:
-            results.append(DocumentUploadResult(file_name=name, error=str(exc)))
+            prepared.append({"name": name, "error": str(exc)})
             continue
 
-        if not force:
+        doc_text = ""
+        # force only bypasses relevance validation; syllabus detection and
+        # draft parsing must always inspect the uploaded content.
+        try:
+            loaded = ingestion_service._load_document(document_service.document_path(record))
+            doc_text = loaded.get("markdown", "")
+        except Exception:  # noqa: BLE001 - parser failures surface as warnings/errors
+            doc_text = ""
+        uploaded_is_syllabus = is_syllabus_document(name, doc_text)
+
+        if target is not None and uploaded_is_syllabus:
+            document_service.delete_document(db, record)
+            prepared.append(
+                {
+                    "name": name,
+                    "error": "A syllabus file cannot be attached as unit material.",
+                }
+            )
+            continue
+
+        if not force and not skip_relevance_gate:
             clazz = db.get(Class, record.class_id)
             if clazz:
                 class_desc = clazz.info.description if getattr(clazz, "info", None) else None
-                doc_path = document_service.document_path(record)
-                try:
-                    loaded = ingestion_service._load_document(doc_path)
-                    doc_text = loaded.get("markdown", "")
-                except Exception:  # noqa: BLE001
-                    doc_text = ""
-
                 is_relevant, rejection_reason = document_validation_service.validate_document_relevance(
                     db,
                     class_name=clazz.name,
@@ -159,15 +243,90 @@ async def upload_documents(
                 )
                 if not is_relevant:
                     document_service.delete_document(db, record)
-                    results.append(
-                        DocumentUploadResult(
-                            file_name=name,
-                            warning=rejection_reason or "Document content does not match course subject.",
-                        )
+                    prepared.append(
+                        {
+                            "name": name,
+                            "warning": rejection_reason
+                            or "Document content does not match course subject.",
+                        }
                     )
                     continue
 
-        results.append(DocumentUploadResult(file_name=name, document=_record_to_read(db, record)))
+        if uploaded_is_syllabus:
+            record.is_syllabus = True
+            db.commit()
+            try:
+                roadmap = parse_syllabus_markdown(doc_text)
+                document_service.save_draft_syllabus_units(db, record, roadmap)
+            except SyllabusFormatError:
+                document_service.delete_document(db, record)
+                prepared.append(
+                    {
+                        "name": name,
+                        "error": "Syllabus format is not recognized or contains no course units.",
+                    }
+                )
+                continue
+            batch_syllabi.append(record)
+
+        prepared.append(
+            {"name": name, "record": record, "is_syllabus": uploaded_is_syllabus}
+        )
+
+    # Phase 2: resolve the batch syllabus. One new syllabus wins over an older
+    # active syllabus; multiple new syllabi without an explicit target are
+    # ambiguous and must not silently bind materials to either one.
+    selected_target = target
+    if selected_target is None and target_error is None:
+        if len(batch_syllabi) > 1:
+            for entry in prepared:
+                record = entry.get("record")
+                if record is not None:
+                    document_service.delete_document(db, record)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Multiple syllabus files in one upload are ambiguous. "
+                    "Upload one syllabus, then attach materials explicitly."
+                ),
+            )
+        if batch_syllabi:
+            selected_target = batch_syllabi[0]
+        elif class_uuid is not None:
+            selected_target, _ = document_service.get_latest_syllabus_record(
+                db, class_uuid
+            )
+
+    for entry in prepared:
+        record = entry.get("record")
+        if (
+            record is not None
+            and not entry.get("is_syllabus")
+            and selected_target is not None
+            and selected_target.id != record.id
+        ):
+            document_service.link_material_to_syllabus(
+                db,
+                record,
+                selected_target,
+                unit_number if target is not None else None,
+            )
+
+    results: list[DocumentUploadResult] = []
+    for entry in prepared:
+        if "error" in entry:
+            results.append(DocumentUploadResult(file_name=entry["name"], error=entry["error"]))
+        elif "warning" in entry:
+            results.append(
+                DocumentUploadResult(file_name=entry["name"], warning=entry["warning"])
+            )
+        else:
+            results.append(
+                DocumentUploadResult(
+                    file_name=entry["name"],
+                    document=_record_to_read(db, entry["record"]),
+                )
+            )
     return DocumentUploadResponse(uploaded=results)
 
 
@@ -200,6 +359,80 @@ def get_documents(
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get(
+    "/classes/{class_id}/syllabus-units",
+    response_model=TeacherSyllabusRead,
+)
+def teacher_syllabus_units(
+    class_id: str,
+    user: User = Depends(require_trainer),
+    db: Session = Depends(get_db),
+) -> TeacherSyllabusRead:
+    """Draft-or-active syllabus units with per-unit materials for the teacher UI."""
+    try:
+        class_uuid = uuid.UUID(class_id)
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="Class not found.")
+    if class_uuid not in set(document_service.my_class_ids(db, user)):
+        raise HTTPException(status_code=403, detail="Class is not assigned to you.")
+
+    (
+        record,
+        is_draft,
+        units,
+        materials_by_unit,
+        syllabus_materials,
+    ) = document_service.get_teacher_syllabus_units(db, class_uuid)
+    if record is None:
+        return TeacherSyllabusRead(class_id=str(class_uuid), units=[])
+
+    ready = document_service.ready_material_count(db, record)
+    total = sum(len(items) for items in materials_by_unit.values()) + len(
+        syllabus_materials
+    )
+    return TeacherSyllabusRead(
+        class_id=str(class_uuid),
+        document_id=str(record.id),
+        file_name=record.file_name,
+        status=record.status,
+        is_draft=is_draft,
+        ready_material_count=ready,
+        total_material_count=total,
+        can_approve=record.status == "pending" and ready > 0,
+        units=[
+            TeacherSyllabusUnitRead(
+                unit_number=unit["unit_number"],
+                unit_title=unit["unit_title"],
+                description=unit["description"],
+                content=unit["content"],
+                materials=[
+                    SyllabusMaterialRead(
+                        id=str(material.id),
+                        file_name=material.file_name,
+                        status=material.status,
+                        failure_reason=material.failure_reason,
+                        version=material.version,
+                        created_at=material.created_at,
+                    )
+                    for material in materials_by_unit.get(unit["unit_number"], [])
+                ],
+            )
+            for unit in units
+        ],
+        syllabus_materials=[
+            SyllabusMaterialRead(
+                id=str(material.id),
+                file_name=material.file_name,
+                status=material.status,
+                failure_reason=material.failure_reason,
+                version=material.version,
+                created_at=material.created_at,
+            )
+            for material in syllabus_materials
+        ],
     )
 
 
@@ -240,6 +473,59 @@ def preview_document(
         filename=record.file_name,
         content_disposition_type="inline",
     )
+
+
+@router.post("/{document_id}/syllabus-link", response_model=DocumentRead)
+def attach_document_to_syllabus(
+    document_id: str,
+    payload: AttachSyllabusMaterialRequest,
+    user: User = Depends(require_trainer),
+    db: Session = Depends(get_db),
+) -> DocumentRead:
+    """Attach an already-uploaded material to a draft/active syllabus unit.
+
+    This is the explicit path for documents uploaded before the syllabus was
+    created (e.g. an indexed PDF), without re-uploading the file.
+    """
+    record = _scoped_document(db, document_id, user)
+    if record.status not in {
+        document_service.STATUS_PENDING,
+        document_service.STATUS_PROCESSING,
+        document_service.STATUS_INDEXED,
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A {record.status} document cannot be attached to a syllabus.",
+        )
+    if document_service.is_syllabus_record(db, record):
+        raise HTTPException(
+            status_code=400,
+            detail="A syllabus file cannot be attached as unit material.",
+        )
+    resolved = document_service.validate_material_target(
+        db,
+        class_id=record.class_id,
+        syllabus_document_id=payload.syllabus_document_id,
+        unit_number=payload.unit_number,
+        user=user,
+    )
+    if isinstance(resolved, str):
+        raise HTTPException(status_code=400, detail=resolved)
+    if resolved.id == record.id:
+        raise HTTPException(
+            status_code=400,
+            detail="A syllabus file cannot be attached as its own material.",
+        )
+    try:
+        record = document_service.link_material_to_syllabus(
+            db,
+            record,
+            resolved,
+            payload.unit_number,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _record_to_read(db, record)
 
 
 @router.post("/{document_id}/approve", response_model=DocumentRead)

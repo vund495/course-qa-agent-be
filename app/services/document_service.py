@@ -14,12 +14,12 @@ import logging
 import uuid
 from pathlib import Path
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.course import Class
-from app.models.document import Document, SyllabusUnit
+from app.models.document import Document, SyllabusDraftUnit, SyllabusUnit
 from app.models.user import User
 from app.services.ingestion.syllabus_parser import SyllabusRoadmapData
 from app.services.vector_store.qdrant_store import (
@@ -455,6 +455,10 @@ def supersede_older_versions(db: Session, record: Document) -> int:
         previous.status = STATUS_REPLACED
     record.status = STATUS_INDEXED
     record.failure_reason = None
+    if record.syllabus_document_id:
+        syllabus = db.get(Document, record.syllabus_document_id)
+        if syllabus is not None and syllabus.status == STATUS_INDEXED:
+            record.hidden_from_students = False
     db.commit()
     for path in paths:
         try:
@@ -551,6 +555,9 @@ def approve_document(db: Session, document_id: uuid.UUID | str) -> Document:
         raise KeyError(str(document_id))
     if record.status != STATUS_PENDING:
         raise ValueError(f"Only pending documents can be approved (is {record.status}).")
+    blocker = syllabus_approval_blocker(db, record)
+    if blocker is not None:
+        raise ValueError(blocker)
     record.status = STATUS_PROCESSING
     record.failure_reason = None
     db.commit()
@@ -616,6 +623,23 @@ def delete_document(db: Session, record: Document) -> int:
     # still own stale points from an interrupted run, so purge them too.
     if record.status not in {STATUS_PENDING, STATUS_REJECTED}:
         purged = purge_document_vectors(record.id)
+    # Explicitly clear unit links: SQLite test databases do not always enforce
+    # ON DELETE SET NULL, and material rows must never become orphaned.
+    # Materials linked to an unpublished syllabus stay hidden even after the
+    # link is gone; unlinking must never make them public by accident.
+    linked_update: dict = {
+        Document.syllabus_document_id: None,
+        Document.syllabus_unit_number: None,
+    }
+    if record.status != STATUS_INDEXED:
+        linked_update[Document.hidden_from_students] = True
+    db.query(Document).filter(Document.syllabus_document_id == record.id).update(
+        linked_update,
+        synchronize_session=False,
+    )
+    db.query(SyllabusDraftUnit).filter(
+        SyllabusDraftUnit.syllabus_document_id == record.id
+    ).delete(synchronize_session=False)
     db.delete(record)
     db.commit()
     if source_path is not None:
@@ -638,14 +662,43 @@ def retrievable_document_ids(db: Session, class_id: uuid.UUID | str) -> set[str]
     except (TypeError, ValueError, AttributeError):
         return set()
     rows = (
-        db.query(Document.id)
+        db.query(
+            Document.id,
+            Document.syllabus_document_id,
+            Document.hidden_from_students,
+        )
         .filter(
             Document.class_id == class_uuid,
             Document.status == STATUS_INDEXED,
         )
         .all()
     )
-    return {str(row[0]) for row in rows}
+    # A material attached to a draft syllabus is not published yet: students
+    # and chat must not see it until its syllabus document is indexed.
+    linked_syllabus_ids = {
+        row[1] for row in rows if row[1] is not None
+    }
+    published_syllabus_ids: set[uuid.UUID] = set()
+    if linked_syllabus_ids:
+        published_syllabus_ids = {
+            row[0]
+            for row in db.query(Document.id)
+            .filter(
+                Document.id.in_(linked_syllabus_ids),
+                Document.status == STATUS_INDEXED,
+            )
+            .all()
+        }
+    allowed: set[str] = set()
+    for row in rows:
+        linked_syllabus_id = row[1]
+        hidden = bool(row[2])
+        if linked_syllabus_id is not None and linked_syllabus_id not in published_syllabus_ids:
+            continue
+        if hidden and linked_syllabus_id is None:
+            continue
+        allowed.add(str(row[0]))
+    return allowed
 
 
 def filter_retrievable_chunks(db: Session, class_id: uuid.UUID | str, chunks: list) -> list:
@@ -765,6 +818,8 @@ def replace_syllabus_roadmap(
     previous_docs = find_previous_syllabus_documents(db, record)
     created = save_syllabus_roadmap(db, record, roadmap)
     retire_previous_syllabus_documents(db, previous_docs)
+    publish_syllabus_materials(db, record.id)
+    clear_draft_syllabus_units(db, record.id)
     return created
 
 
@@ -794,3 +849,288 @@ def get_class_syllabus_roadmap(
     units = [r[0] for r in rows]
     topic_outline = units[0].topic_outline if units else None
     return doc, topic_outline, units
+
+# ---------------------------------------------------------------------------
+# Draft syllabus units and per-unit materials (AI-166)
+# ---------------------------------------------------------------------------
+
+
+def save_draft_syllabus_units(
+    db: Session, record: Document, roadmap: SyllabusRoadmapData
+) -> list[SyllabusDraftUnit]:
+    """Replace the teacher-only draft units parsed from an upload."""
+    clear_draft_syllabus_units(db, record.id)
+    created: list[SyllabusDraftUnit] = []
+    for unit in roadmap.units:
+        row = SyllabusDraftUnit(
+            id=uuid.uuid4(),
+            class_id=record.class_id,
+            syllabus_document_id=record.id,
+            unit_number=unit.unit_number,
+            unit_title=unit.unit_title,
+            description=unit.description,
+            content=unit.content,
+            topic_outline=roadmap.topic_outline,
+        )
+        db.add(row)
+        created.append(row)
+    db.commit()
+    return created
+
+
+def clear_draft_syllabus_units(db: Session, document_id: uuid.UUID | str) -> int:
+    """Delete preview units for one syllabus upload without touching active units."""
+    try:
+        doc_uuid = uuid.UUID(str(document_id))
+    except (TypeError, ValueError, AttributeError):
+        return 0
+    deleted = (
+        db.query(SyllabusDraftUnit)
+        .filter(SyllabusDraftUnit.syllabus_document_id == doc_uuid)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return int(deleted)
+
+
+def publish_syllabus_materials(db: Session, document_id: uuid.UUID | str) -> int:
+    """Make materials linked to a now-indexed syllabus visible to students."""
+    try:
+        doc_uuid = uuid.UUID(str(document_id))
+    except (TypeError, ValueError, AttributeError):
+        return 0
+    updated = (
+        db.query(Document)
+        .filter(Document.syllabus_document_id == doc_uuid)
+        .update({Document.hidden_from_students: False}, synchronize_session=False)
+    )
+    db.commit()
+    return int(updated)
+
+
+def get_draft_syllabus_units(
+    db: Session, document_id: uuid.UUID | str
+) -> list[SyllabusDraftUnit]:
+    try:
+        doc_uuid = uuid.UUID(str(document_id))
+    except (TypeError, ValueError, AttributeError):
+        return []
+    return (
+        db.query(SyllabusDraftUnit)
+        .filter(SyllabusDraftUnit.syllabus_document_id == doc_uuid)
+        .order_by(SyllabusDraftUnit.unit_number.asc())
+        .all()
+    )
+
+
+def is_syllabus_record(db: Session, record: Document) -> bool:
+    """A record is a syllabus when flagged or when it owns units."""
+    if bool(getattr(record, "is_syllabus", False)):
+        return True
+    has_draft = (
+        db.query(SyllabusDraftUnit.id)
+        .filter(SyllabusDraftUnit.syllabus_document_id == record.id)
+        .first()
+        is not None
+    )
+    if has_draft:
+        return True
+    return (
+        db.query(SyllabusUnit.id)
+        .filter(SyllabusUnit.document_id == record.id)
+        .first()
+        is not None
+    )
+
+
+def _syllabus_unit_numbers(db: Session, record: Document) -> set[int]:
+    if record.status == STATUS_INDEXED:
+        return {
+            row[0]
+            for row in db.query(SyllabusUnit.unit_number)
+            .filter(SyllabusUnit.document_id == record.id)
+            .all()
+        }
+    return {
+        row[0]
+        for row in db.query(SyllabusDraftUnit.unit_number)
+        .filter(SyllabusDraftUnit.syllabus_document_id == record.id)
+        .all()
+    }
+
+
+def get_latest_syllabus_record(
+    db: Session, class_id: uuid.UUID | str
+) -> tuple[Document | None, bool]:
+    """Return the newest draft syllabus, else the active indexed syllabus."""
+    try:
+        class_uuid = uuid.UUID(str(class_id))
+    except (TypeError, ValueError, AttributeError):
+        return None, False
+    draft = (
+        db.query(Document)
+        .join(
+            SyllabusDraftUnit,
+            SyllabusDraftUnit.syllabus_document_id == Document.id,
+        )
+        .filter(
+            Document.class_id == class_uuid,
+            Document.status.in_((STATUS_PENDING, STATUS_PROCESSING)),
+        )
+        .order_by(Document.created_at.desc(), Document.version.desc())
+        .first()
+    )
+    if draft is not None:
+        return draft, True
+    active, _, _ = get_class_syllabus_roadmap(db, class_uuid)
+    return active, False
+
+
+def validate_material_target(
+    db: Session,
+    *,
+    class_id: uuid.UUID,
+    syllabus_document_id: uuid.UUID | str,
+    unit_number: int | None,
+    user: User,
+) -> Document | str:
+    """Validate that a material belongs to the same class syllabus (unit optional)."""
+    if class_id not in set(my_class_ids(db, user)):
+        return "Class is not assigned to you."
+    try:
+        syllabus_uuid = uuid.UUID(str(syllabus_document_id))
+    except (TypeError, ValueError, AttributeError):
+        return "Syllabus document not found."
+    record = get_document(db, syllabus_uuid)
+    if record is None or record.class_id != class_id:
+        return "Syllabus document not found in this class."
+    if not is_syllabus_record(db, record):
+        return "Selected document is not a syllabus."
+    if record.status not in {STATUS_PENDING, STATUS_PROCESSING, STATUS_INDEXED}:
+        return "This syllabus cannot receive materials in its current status."
+    if record.status == STATUS_INDEXED:
+        active, _, _ = get_class_syllabus_roadmap(db, class_id)
+        if active is None or active.id != record.id:
+            return "Only the active approved syllabus can receive materials."
+    if unit_number is not None:
+        allowed_units = _syllabus_unit_numbers(db, record)
+        if unit_number not in allowed_units:
+            return f"Unit {unit_number} was not found in this syllabus."
+    return record
+
+
+def link_material_to_syllabus(
+    db: Session,
+    record: Document,
+    syllabus: Document,
+    unit_number: int | None = None,
+) -> Document:
+    """Attach an existing material to a syllabus (draft or active)."""
+    if record.id == syllabus.id or is_syllabus_record(db, record):
+        raise ValueError("A syllabus file cannot be attached as unit material.")
+    if record.class_id != syllabus.class_id:
+        raise ValueError("Material and syllabus belong to different classes.")
+    record.syllabus_document_id = syllabus.id
+    record.syllabus_unit_number = unit_number
+    # Draft-linked materials remain private until the syllabus is indexed.
+    record.hidden_from_students = syllabus.status != STATUS_INDEXED
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def ready_material_count(db: Session, record: Document) -> int:
+    """Count indexed materials explicitly linked to this exact syllabus.
+
+    Syllabus-level materials (no unit) count, because the approval condition is
+    whole-syllabus rather than per-unit. Materials linked to another class or
+    another syllabus are excluded by the filters below.
+    """
+    unit_numbers = _syllabus_unit_numbers(db, record)
+    unit_filter = (
+        or_(
+            Document.syllabus_unit_number.is_(None),
+            Document.syllabus_unit_number.in_(unit_numbers),
+        )
+        if unit_numbers
+        else Document.syllabus_unit_number.is_(None)
+    )
+    return int(
+        db.query(func.count(Document.id))
+        .filter(
+            Document.class_id == record.class_id,
+            Document.syllabus_document_id == record.id,
+            Document.id != record.id,
+            Document.is_syllabus.is_(False),
+            unit_filter,
+            Document.status == STATUS_INDEXED,
+        )
+        .scalar()
+        or 0
+    )
+
+
+def syllabus_approval_blocker(db: Session, record: Document) -> str | None:
+    """Return the teacher-facing reason a syllabus cannot be approved yet."""
+    if not is_syllabus_record(db, record):
+        return None
+    if ready_material_count(db, record) > 0:
+        return None
+    return (
+        "Approve requires at least one ready material linked to this syllabus. "
+        "Upload material to any unit, approve it, and wait until it is indexed."
+    )
+
+
+def get_teacher_syllabus_units(
+    db: Session, class_id: uuid.UUID | str
+) -> tuple[
+    Document | None,
+    bool,
+    list[dict],
+    dict[int, list[Document]],
+    list[Document],
+]:
+    """Return draft-or-active units, per-unit materials, and syllabus-level materials."""
+    record, is_draft = get_latest_syllabus_record(db, class_id)
+    if record is None:
+        return None, False, [], {}, []
+    if is_draft:
+        rows = get_draft_syllabus_units(db, record.id)
+        units = [
+            {
+                "unit_number": row.unit_number,
+                "unit_title": row.unit_title,
+                "description": row.description,
+                "content": row.content,
+            }
+            for row in rows
+        ]
+    else:
+        _, _, rows = get_class_syllabus_roadmap(db, class_id)
+        units = [
+            {
+                "unit_number": row.unit_number,
+                "unit_title": row.unit_title,
+                "description": row.description,
+                "content": row.content,
+            }
+            for row in rows
+        ]
+    materials = (
+        db.query(Document)
+        .filter(
+            Document.class_id == record.class_id,
+            Document.syllabus_document_id == record.id,
+        )
+        .order_by(Document.created_at.asc(), Document.version.asc())
+        .all()
+    )
+    by_unit: dict[int, list[Document]] = {unit["unit_number"]: [] for unit in units}
+    without_unit: list[Document] = []
+    for material in materials:
+        if material.syllabus_unit_number is None:
+            without_unit.append(material)
+        elif material.syllabus_unit_number in by_unit:
+            by_unit[material.syllabus_unit_number].append(material)
+    return record, is_draft, units, by_unit, without_unit
