@@ -40,7 +40,7 @@ effective_input = min(CHAT_INPUT_MAX_TOKENS,
 
 The configured answer cap must also fit the model's output limit. Invalid model metadata or an impossible budget fails before answer generation.
 
-The legacy `CHAT_CONTEXT_EXCHANGES` and `CHAT_CONTEXT_MAX_CHARS` limits remain. The default recent-history window is five complete question/answer pairs; its configurable maximum is twenty. The answer-history helper removes whole exchanges to respect the character cap and never splits on user-supplied `Student:` text.
+The rolling history window defaults to **20 complete question/answer exchanges** (`CHAT_CONTEXT_EXCHANGES=20`). After exchange 20, new turns continue using the latest 20 exchanges. A 30,000-character safety cap prevents oversized history from reaching prompt fitting; token-budget fitting may further remove the oldest exchanges when required by the model input ceiling. The history helper never splits an exchange or user-supplied `Student:` text.
 
 ## Data flow and truncation
 
