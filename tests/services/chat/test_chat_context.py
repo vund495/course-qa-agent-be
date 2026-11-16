@@ -109,6 +109,30 @@ def test_load_recent_exchanges_returns_last_complete_pairs(db_session: Session) 
     assert [exchange.assistant for exchange in history] == ["answer 3", "answer 4"]
 
 
+def test_default_context_window_keeps_latest_twenty_exchanges(db_session, monkeypatch):
+    session = _session(db_session)
+    for index in range(1, 23):
+        _add_exchange(
+            db_session,
+            session,
+            question=f"question {index}",
+            answer=f"answer {index}",
+            offset=index,
+        )
+
+    monkeypatch.setattr(chat_context_service.settings, "chat_context_exchanges", 20)
+    monkeypatch.setattr(chat_context_service.settings, "chat_context_max_chars", 30000)
+    history = chat_context_service.load_recent_exchanges(
+        db_session,
+        session_id=session.id,
+        user_id=session.user_id,
+        class_id=session.class_id,
+    )
+
+    assert len(history) == 20
+    assert [exchange.user for exchange in history] == [f"question {i}" for i in range(3, 23)]
+
+
 def test_load_recent_exchanges_drops_orphaned_messages(db_session: Session) -> None:
     session = _session(db_session)
     db_session.add(

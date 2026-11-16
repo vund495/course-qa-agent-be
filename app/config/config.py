@@ -266,13 +266,13 @@ class Settings(BaseSettings):
 
     # AI-63 conversation memory: keep the last N complete Q&A exchanges.
     chat_context_exchanges: int = Field(
-        default=5,
+        default=20,
         ge=1,
         le=20,
         validation_alias="CHAT_CONTEXT_EXCHANGES",
     )
     chat_context_max_chars: int = Field(
-        default=6000,
+        default=30000,
         ge=500,
         le=30000,
         validation_alias="CHAT_CONTEXT_MAX_CHARS",
