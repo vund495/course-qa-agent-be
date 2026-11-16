@@ -13,7 +13,7 @@ Both branches start at `ad8e3ea1ee5cea816b9649ba963067fe464afcca` (`origin/main`
 | `features/Implementation_ChatContextTokenBudget` | Backend code, configuration, tests, benchmark script |
 | `features/Design_ChatContextTokenBudget` | This design and validation record |
 
-Implementation changes live in the normal backend checkout, reached through `course-qa-workspace/be`. The separate design worktree lives inside the workspace at `.worktrees/ai190-design`. The implementation and design branches have local commits; neither has been pushed. The Vietnamese implementation plan is stored at `resources/plans/ai-190-chat-context-token-budget-plan.md` in the workspace.
+Implementation changes live in the normal backend checkout, reached through `course-qa-workspace/be`. The separate design worktree lives inside the workspace at `.worktrees/ai190-design`. The Vietnamese implementation plan is stored at `resources/plans/ai-190-chat-context-token-budget-plan.md` in the workspace.
 
 ## Configuration and invariants
 
@@ -133,4 +133,4 @@ Final focused validation: **232 passed** across chat services, chat router and L
 
 The current focused run covered the latest AI-190 changes. The full-suite result is not fully green because of the two unrelated live Gemini embedding authentication failures above; rerun those tests with a valid API key to verify the existing real-API checks.
 
-AC-05 has both an offline full-stream integration check and the live synthetic twenty-turn fitting/generation check above. This does not claim an end-to-end HTTP/browser test or answer-quality evaluation. The changes are committed locally on their separate implementation and design branches; they have not been pushed, and no merge request or Jira closure was performed.
+AC-05 has both an offline full-stream integration check and the live synthetic twenty-turn fitting/generation check above. This does not claim an end-to-end HTTP/browser test or answer-quality evaluation. The implementation and design changes are maintained on separate branches. Jira was not closed as part of this work.
