@@ -270,6 +270,8 @@ def _budget_renderer(messages, chunks, web_results):
         block = rag_service._curriculum_context_line(index, chunk)
         if block in context:
             context = context.replace(block, "", 1)
+            if chunk.content.startswith("### Structured Course Syllabus Roadmap (Authoritative Source):"):
+                context = context.replace(chunk.content, "", 1)
             sources.append(
                 token_budget_service.ContextSource(
                     chunk.content,

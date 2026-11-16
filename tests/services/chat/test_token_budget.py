@@ -122,6 +122,62 @@ def test_render_keeps_code_and_final_instructions_and_syncs_citations():
     assert "low " not in messages[1].content
 
 
+def test_syllabus_roadmap_keeps_document_identity_when_budgeted():
+    from app.services import chat_service, rag_service
+
+    roadmap = "### Structured Course Syllabus Roadmap (Authoritative Source):\n- Unit 1: Loops"
+    chunk = rag_service.ScoredChunk(roadmap, 1.0, {"document_id": "syllabus", "title": "Syllabus"})
+    messages = chat_service._format_messages(
+        "answer-course-prompt",
+        context=chat_service._with_syllabus(
+            chat_service._course_context([chunk]), None, syllabus_roadmap=roadmap
+        ),
+        question="What is covered?",
+    )
+    _, sources = chat_service._budget_renderer(messages, [chunk], [])
+    assert len(sources) == 1
+    assert sources[0].identity == ("document", chunk)
+
+
+def test_fallback_rejects_prompt_above_configured_input_cap(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from app.services.llm import gateway
+
+    async def close():
+        pass
+
+    async def count(_text):
+        return 24001
+
+    async def counter(db, model=None, **kwargs):
+        return SimpleNamespace(
+            input_limit=100000,
+            output_limit=10000,
+            count=count,
+            client=SimpleNamespace(aclose=close),
+        )
+
+    monkeypatch.setattr(budget, "open_counter", counter)
+    monkeypatch.setattr(gateway, "_candidate_models", lambda *args: ["fallback"])
+    opener = MagicMock()
+    opener.side_effect = AssertionError("answer stream must not open")
+    monkeypatch.setattr(gateway, "_open_stream", opener)
+
+    async def collect():
+        return [
+            item
+            async for item in gateway.astream_chat(
+                MagicMock(), render([], []), model="primary", max_output_tokens=4000
+            )
+        ]
+
+    with pytest.raises(budget.TokenBudgetError):
+        asyncio.run(collect())
+    opener.assert_not_called()
+
+
 def test_gateway_enforces_output_limit_and_rechecks_fallback(monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import MagicMock

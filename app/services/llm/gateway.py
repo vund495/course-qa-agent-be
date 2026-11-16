@@ -188,15 +188,18 @@ async def astream_chat(
             )
             try:
                 count = await counter.count(token_budget_service.prompt_text(messages))
+                ceiling = min(
+                    token_budget_service.settings.chat_input_max_tokens,
+                    counter.input_limit
+                    - max_output_tokens
+                    - token_budget_service.settings.chat_token_safety_margin,
+                )
                 if (
                     max_output_tokens > counter.output_limit
-                    or count
-                    + max_output_tokens
-                    + token_budget_service.settings.chat_token_safety_margin
-                    > counter.input_limit
+                    or count > ceiling
                 ):
                     raise token_budget_service.TokenBudgetError(
-                        "Ngữ cảnh vượt giới hạn model dự phòng. Vui lòng rút ngắn câu hỏi."
+                        "The chat context exceeds the fallback model token budget. Please shorten the question."
                     )
             finally:
                 await counter.client.aclose()
