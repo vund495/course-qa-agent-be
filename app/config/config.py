@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import ClassVar, Literal
 
-from pydantic import AliasChoices, EmailStr, Field, SecretStr, field_validator
+from pydantic import AliasChoices, EmailStr, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -278,6 +278,29 @@ class Settings(BaseSettings):
         validation_alias="CHAT_CONTEXT_MAX_CHARS",
     )
 
+    # AI-190 answer prompt token budgets.
+    chat_input_max_tokens: int = Field(
+        default=24000, ge=1, validation_alias="CHAT_INPUT_MAX_TOKENS"
+    )
+    chat_system_max_tokens: int = Field(
+        default=6000, ge=1, validation_alias="CHAT_SYSTEM_MAX_TOKENS"
+    )
+    chat_history_max_tokens: int = Field(
+        default=4000, ge=1, validation_alias="CHAT_HISTORY_MAX_TOKENS"
+    )
+    chat_documents_max_tokens: int = Field(
+        default=12000, ge=1, validation_alias="CHAT_DOCUMENTS_MAX_TOKENS"
+    )
+    chat_answer_max_tokens: int = Field(
+        default=4000, ge=1, validation_alias="CHAT_ANSWER_MAX_TOKENS"
+    )
+    chat_token_safety_margin: int = Field(
+        default=1000, ge=1, validation_alias="CHAT_TOKEN_SAFETY_MARGIN"
+    )
+    chat_token_count_timeout_seconds: float = Field(
+        default=5.0, gt=0, le=15, validation_alias="CHAT_TOKEN_COUNT_TIMEOUT_SECONDS"
+    )
+
     # AI-125 suggested follow-up questions
     chat_suggestions_enabled: bool = Field(
         default=True,
@@ -358,6 +381,20 @@ class Settings(BaseSettings):
         validation_alias="PROMPT_FILE",
     )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+
+    @model_validator(mode="after")
+    def validate_chat_token_budgets(self):
+        """Section caps cannot exceed the total input cap."""
+        if any(
+            value > self.chat_input_max_tokens
+            for value in (
+                self.chat_system_max_tokens,
+                self.chat_history_max_tokens,
+                self.chat_documents_max_tokens,
+            )
+        ):
+            raise ValueError("Chat section token caps must not exceed CHAT_INPUT_MAX_TOKENS")
+        return self
 
     @field_validator(
         "google_api_key",

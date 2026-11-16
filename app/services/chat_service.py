@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -29,6 +29,7 @@ from app.services import (
     quick_response_service,
     rag_service,
     suggestion_service,
+    token_budget_service,
 )
 from app.services.chat_context_service import ConversationExchange
 from app.services.llm import gateway
@@ -47,12 +48,35 @@ def _is_syllabus_relevant_question(question: str, verdict: str | None = None) ->
         return True
     q_lower = question.lower()
     syllabus_keywords = (
-        "syllabus", "roadmap", "lịch trình", "tiến độ", "kế hoạch", "outline",
-        "bao nhiêu buổi", "bao nhiêu unit", "bao nhiêu chương", "bao nhiêu tuần",
-        "how many sessions", "how many units", "how many chapters", "how many weeks",
-        "grading", "điểm số", "tỷ lệ điểm", "trọng số", "thi cuối kỳ", "giữa kỳ",
-        "chuyên cần", "attendance", "learning outcome", "chuẩn đầu ra",
-        "prerequisite", "tiên quyết", "course schedule", "lịch học", "thời khóa biểu",
+        "syllabus",
+        "roadmap",
+        "lịch trình",
+        "tiến độ",
+        "kế hoạch",
+        "outline",
+        "bao nhiêu buổi",
+        "bao nhiêu unit",
+        "bao nhiêu chương",
+        "bao nhiêu tuần",
+        "how many sessions",
+        "how many units",
+        "how many chapters",
+        "how many weeks",
+        "grading",
+        "điểm số",
+        "tỷ lệ điểm",
+        "trọng số",
+        "thi cuối kỳ",
+        "giữa kỳ",
+        "chuyên cần",
+        "attendance",
+        "learning outcome",
+        "chuẩn đầu ra",
+        "prerequisite",
+        "tiên quyết",
+        "course schedule",
+        "lịch học",
+        "thời khóa biểu",
     )
     return any(kw in q_lower for kw in syllabus_keywords)
 
@@ -101,6 +125,7 @@ def _format_syllabus_roadmap(
             exc_info=True,
         )
         return "", None
+
 
 _HOMEWORK_PATTERNS = re.compile(
     r"(?:"
@@ -178,8 +203,18 @@ def _answer_stream(
     messages: list[Any],
 ) -> AsyncIterator[str | gateway.StreamRestart]:
     if model is not None:
-        return _stream_model(model, messages)
-    return gateway.astream_chat(db, messages)
+        return _stream_model(
+            model.bind(max_output_tokens=settings.chat_answer_max_tokens)
+            if hasattr(model, "bind")
+            else model,
+            messages,
+        )
+    return gateway.astream_chat(
+        db,
+        messages,
+        max_output_tokens=settings.chat_answer_max_tokens,
+        validated_model=getattr(messages, "validated_model", None),
+    )
 
 
 def _course_context(
@@ -216,6 +251,121 @@ def _with_syllabus(
     return "\n\n".join(sections) if sections else context
 
 
+class AnswerMessages(list):
+    """Rendered messages retaining the inputs needed for safe budget re-rendering."""
+
+    def __init__(self, messages, *, prompt_name, context, question, history):
+        super().__init__(messages)
+        self.prompt_name = prompt_name
+        self.context = context
+        self.question = question
+        self.history = history
+
+
+def _budget_renderer(messages, chunks, web_results):
+    """Keep structured evidence until selection, then rebuild citation numbers."""
+    context = messages.context
+    sources = []
+    for index, chunk in enumerate(chunks, 1):
+        block = rag_service._curriculum_context_line(index, chunk)
+        if block in context:
+            context = context.replace(block, "", 1)
+            if chunk.content.startswith("### Structured Course Syllabus Roadmap (Authoritative Source):"):
+                context = context.replace(chunk.content, "", 1)
+            sources.append(
+                token_budget_service.ContextSource(
+                    chunk.content,
+                    chunk.score or 0,
+                    ("document", chunk),
+                    prefix=block.removeprefix(f"[{index}] ").removesuffix(chunk.content),
+                )
+            )
+    for index, result in enumerate(web_results, len(chunks) + 1):
+        variants = (
+            f"[{index}] ({result.title}):\n{result.content}",
+            f"Source ({result.title}):\n{result.content}",
+        )
+        for block in variants:
+            if block in context:
+                context = context.replace(block, "", 1)
+                sources.append(
+                    token_budget_service.ContextSource(
+                        result.content, -index, ("web", result), prefix=f"({result.title}):\n"
+                    )
+                )
+                break
+    # Student code is mandatory input, never treated as discardable evidence.
+    context, code_marker, code = context.partition("### Student Code / Error Trace:")
+    protected = code_marker + code
+    if context.strip():
+        sources.append(
+            token_budget_service.ContextSource(
+                context.strip(),
+                float("inf") if "Structured Course Syllabus Roadmap" in context else -10000,
+                ("supplement", None),
+            )
+        )
+
+    def render(history, selected):
+        documents = [item for item in selected if item.identity[0] == "document"]
+        internet = [item for item in selected if item.identity[0] == "web"]
+        supplements = [item.content for item in selected if item.identity[0] == "supplement"]
+        blocks = list(supplements)
+        blocks.extend(f"[{i}] {item.prefix}{item.content}" for i, item in enumerate(documents, 1))
+        blocks.extend(
+            f"[{i}] ({item.identity[1].title}):\n{item.content}"
+            for i, item in enumerate(internet, len(documents) + 1)
+        )
+        if protected:
+            blocks.append(protected)
+        prompt = _format_messages(
+            messages.prompt_name,
+            context="\n\n".join(blocks),
+            question=messages.question,
+            history="\n\n".join(history),
+        )
+        # Preserve all branch-specific tutoring and language instructions.
+        prompt[0] = messages[0]
+        return prompt
+
+    return render, sources
+
+
+async def _apply_token_budget(db, messages, slide_chunks, web_results, history):
+    try:
+        async with asyncio.timeout(15):
+            render, sources = _budget_renderer(messages, slide_chunks, web_results)
+            counter = await token_budget_service.open_counter(db)
+            try:
+                result = await token_budget_service.fit_prompt(
+                    render,
+                    chat_context_service.answer_history_blocks(history),
+                    sources,
+                    counter,
+                )
+                documents = [
+                    replace(item.identity[1], content=item.content)
+                    for item in result.sources
+                    if item.identity[0] == "document"
+                ]
+                internet = [
+                    replace(item.identity[1], content=item.content)
+                    for item in result.sources
+                    if item.identity[0] == "web"
+                ]
+                result.messages.validated_model = counter.model
+                result.messages.token_allowance = getattr(counter, "allowance", None)
+                return result.messages, documents, internet
+            finally:
+                await counter.client.aclose()
+    except token_budget_service.TokenBudgetError:
+        raise
+    except Exception as exc:
+        raise token_budget_service.TokenBudgetError(
+            "Unable to validate the chat context size. Please try again."
+        ) from exc
+
+
 def _format_messages(
     prompt_name: str,
     *,
@@ -232,10 +382,16 @@ def _format_messages(
         history=history or "(No previous conversation.)",
     )
 
-    return [
-        SystemMessage(content=str(prompt["system-prompt"])),
-        HumanMessage(content=str(prompt["user-prompt"])),
-    ]
+    return AnswerMessages(
+        [
+            SystemMessage(content=str(prompt["system-prompt"])),
+            HumanMessage(content=str(prompt["user-prompt"])),
+        ],
+        prompt_name=prompt_name,
+        context=context,
+        question=question,
+        history=history,
+    )
 
 
 def _tag_pedagogy(
@@ -247,15 +403,45 @@ def _tag_pedagogy(
     """Determine pedagogical category for Content Gap analytics (0 extra API requests)."""
     msg_l = (message or "").lower()
     if any(p.search(code_content) for p in decision_service._COMPILER_ERROR_PATTERNS) or any(
-        kw in msg_l for kw in ["lỗi", "error", "segfault", "crash", "leak", "bug", "sai ở đâu", "tại sao sai"]
+        kw in msg_l
+        for kw in ["lỗi", "error", "segfault", "crash", "leak", "bug", "sai ở đâu", "tại sao sai"]
     ):
         return "Troubleshooting & Edge Cases"
-    if (scope_decision and getattr(scope_decision, "verdict", None) == decision_service.ScopeVerdict.COMPARISON.value) or any(
-        kw in msg_l for kw in ["so sánh", "vs", "compare", "khác nhau", "nhanh hơn", "ưu nhược điểm", "phân biệt"]
+    if (
+        scope_decision
+        and getattr(scope_decision, "verdict", None)
+        == decision_service.ScopeVerdict.COMPARISON.value
+    ) or any(
+        kw in msg_l
+        for kw in [
+            "so sánh",
+            "vs",
+            "compare",
+            "khác nhau",
+            "nhanh hơn",
+            "ưu nhược điểm",
+            "phân biệt",
+        ]
     ):
         return "In-Scope Comparison"
-    if bool(code_content) or action in ("code_help", "docs_socratic") or any(
-        kw in msg_l for kw in ["code", "syntax", "thực hành", "bài tập", "hướng dẫn", "ví dụ", "example", "cài đặt", "hàm", "function"]
+    if (
+        bool(code_content)
+        or action in ("code_help", "docs_socratic")
+        or any(
+            kw in msg_l
+            for kw in [
+                "code",
+                "syntax",
+                "thực hành",
+                "bài tập",
+                "hướng dẫn",
+                "ví dụ",
+                "example",
+                "cài đặt",
+                "hàm",
+                "function",
+            ]
+        )
     ):
         return "Practical Implementation"
     return "Foundational Concepts"
@@ -381,12 +567,11 @@ def _determine_chat_action(
     """Resolve the pipeline action based on the refined Truth Table."""
     raw_verdict = scope_decision.verdict if scope_decision else None
     verdict = (
-        raw_verdict.value if hasattr(raw_verdict, "value") else str(raw_verdict)
-    ).lower() if raw_verdict is not None else None
-    gate_low_confidence = (
-        scope_decision is None
-        or scope_decision.confidence < confidence_threshold
+        (raw_verdict.value if hasattr(raw_verdict, "value") else str(raw_verdict)).lower()
+        if raw_verdict is not None
+        else None
     )
+    gate_low_confidence = scope_decision is None or scope_decision.confidence < confidence_threshold
 
     if is_hw:
         if has_code:
@@ -438,7 +623,6 @@ def _determine_chat_action(
         if is_syllabus_q and has_roadmap:
             return "docs"
         return "web_search"
-
 
 
 async def stream_chat(
@@ -551,11 +735,12 @@ async def stream_chat(
                 max_chars=settings.chat_scope_history_max_chars,
             )
 
-            clean_message, student_code, has_code = decision_service.preprocess_student_query(message)
+            clean_message, student_code, has_code = decision_service.preprocess_student_query(
+                message
+            )
             pre_retrieval_started = time.monotonic()
             deadline = (
-                asyncio.get_running_loop().time()
-                + settings.chat_pre_retrieval_timeout_seconds
+                asyncio.get_running_loop().time() + settings.chat_pre_retrieval_timeout_seconds
             )
             gate_question = clean_message if clean_message else "Analyze student code"
             scope_decision: decision_service.ScopeDecision | None = None
@@ -623,8 +808,7 @@ async def stream_chat(
                 ):
                     await _cancel_tasks(rewrite_task)
                     logger.info(
-                        "Scope gate blocked the turn after %.2fs "
-                        "(class=%s, rewrite_cancelled=%s).",
+                        "Scope gate blocked the turn after %.2fs (class=%s, rewrite_cancelled=%s).",
                         gate_elapsed,
                         class_id,
                         rewrite_task is not None,
@@ -641,7 +825,9 @@ async def stream_chat(
                         )
                     answer_parts.append(text)
                     yield _sse("token", {"text": text})
-                    trace_steps["pedagogy"] = f"pedagogy:{_tag_pedagogy(message, student_code, scope_decision)}"
+                    trace_steps["pedagogy"] = (
+                        f"pedagogy:{_tag_pedagogy(message, student_code, scope_decision)}"
+                    )
                     saved_turn = await _persist_turn(
                         db=db,
                         user_id=user_id,
@@ -681,7 +867,9 @@ async def stream_chat(
                     "progress", {"stage": "searching", "message": "Searching class materials"}
                 )
 
-                standalone_question = clean_message if clean_message else "Explain and debug the student code:"
+                standalone_question = (
+                    clean_message if clean_message else "Explain and debug the student code:"
+                )
                 if rewrite_task is not None:
                     stage = "follow-up question resolution"
                     try:
@@ -726,22 +914,32 @@ async def stream_chat(
             stage = "class retrieval and reranking"
             stage_started = time.monotonic()
             retrieval_query = standalone_question
-            if not retrieval_query.strip() or retrieval_query == "Explain and debug the student code:":
+            if (
+                not retrieval_query.strip()
+                or retrieval_query == "Explain and debug the student code:"
+            ):
                 retrieval_query = student_code[:300].strip() if has_code else standalone_question
 
-            logger.info("Starting class retrieval and reranking for class %s (query_chars=%d).", class_id, len(retrieval_query))
+            logger.info(
+                "Starting class retrieval and reranking for class %s (query_chars=%d).",
+                class_id,
+                len(retrieval_query),
+            )
             search_query_en = scope_decision.search_query_en if scope_decision else None
             retrieval_kwargs: dict[str, Any] = {"question": retrieval_query, "class_id": class_id}
             if search_query_en is not None:
                 try:
                     import inspect
+
                     sig = inspect.signature(chat_retrieval_service.retrieve_for_chat)
                     if "search_query_en" in sig.parameters or any(
                         p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
                     ):
                         retrieval_kwargs["search_query_en"] = search_query_en
                 except Exception:
-                    logger.debug("Could not pass search_query_en to retrieve_for_chat", exc_info=True)
+                    logger.debug(
+                        "Could not pass search_query_en to retrieve_for_chat", exc_info=True
+                    )
 
             decision = await asyncio.to_thread(
                 chat_retrieval_service.retrieve_for_chat,
@@ -755,7 +953,9 @@ async def stream_chat(
                 len(decision.chunks),
             )
 
-            is_high_zone = decision.top_score is not None and decision.top_score >= decision.threshold
+            is_high_zone = (
+                decision.top_score is not None and decision.top_score >= decision.threshold
+            )
             is_mid_zone = (
                 decision.top_score is not None
                 and decision.unrelated_threshold <= decision.top_score < decision.threshold
@@ -796,7 +996,8 @@ async def stream_chat(
 
             if action in ("docs", "docs_socratic"):
                 substantive_chunks = [
-                    c for c in (decision.chunks or [])
+                    c
+                    for c in (decision.chunks or [])
                     if c.score is not None and c.score >= (decision.unrelated_threshold or 0.40)
                 ]
                 if substantive_chunks:
@@ -818,7 +1019,8 @@ async def stream_chat(
                     slide_chunks = list(substantive_chunks)
                     if roadmap_chunk is not None and is_syllabus_q:
                         slide_chunks = [roadmap_chunk] + [
-                            c for c in substantive_chunks
+                            c
+                            for c in substantive_chunks
                             if c.document_id != roadmap_chunk.document_id
                         ]
                     messages = _format_messages(
@@ -842,19 +1044,19 @@ async def stream_chat(
                     if action == "docs_socratic" or is_hw:
                         messages[0] = SystemMessage(
                             content=(
-                            "You are an Academic Socratic Tutor for this course.\n"
-                            "The student is asking for help with their homework, lab assignment, or asking you to write code for an exercise.\n\n"
-                            "STRICT PEDAGOGICAL / ANTI-CHEATING RULES:\n"
-                            "1. ABSOLUTELY NO COMPLETE CODE: Under NO circumstances should you provide complete, copy-pasteable, runnable code or full function implementations (such as a complete recursive factorial function or main() method). Never write the final answer for the student.\n"
-                            "2. Concept Explanation: Explain mathematical concepts clearly. NEVER use dollar signs ($) or LaTeX math delimiters ($...$ or $...$). Write all formulas, equations, and variables as plain text or inline code in backticks (e.g. `n! = n * (n-1)!`, `0! = 1`, `F(0) = 0`).\n"
-                            "3. Socratic Breakdown: Guide the student step-by-step through the thought process:\n"
-                            "   - What is the Base Case (stopping condition to prevent stack overflow or infinite loops)?\n"
-                            "   - What is the Recursive Step (recurrence relation to break the problem into smaller subproblems)?\n"
-                            "4. Pseudocode & Skeleton: Provide pseudocode, algorithm logic, or a code skeleton with blanks/TODO comments only (e.g. `// TODO: write base condition here`).\n"
-                            "5. Guiding Questions: Ask 1-2 targeted Socratic questions encouraging the student to implement the missing parts and reply with their solution.\n"
-                            "6. Citations: Reference the provided Course Materials [1..N] where relevant. If not available, rely on standard computer science principles without apologizing or saying documents are missing.\n"
-                            "7. Tone & Language: Enthusiastic, supportive, pedagogical. Always respond in the exact language of the user's question (e.g. English if asked in English, Vietnamese if asked in Vietnamese)."
-                        )
+                                "You are an Academic Socratic Tutor for this course.\n"
+                                "The student is asking for help with their homework, lab assignment, or asking you to write code for an exercise.\n\n"
+                                "STRICT PEDAGOGICAL / ANTI-CHEATING RULES:\n"
+                                "1. ABSOLUTELY NO COMPLETE CODE: Under NO circumstances should you provide complete, copy-pasteable, runnable code or full function implementations (such as a complete recursive factorial function or main() method). Never write the final answer for the student.\n"
+                                "2. Concept Explanation: Explain mathematical concepts clearly. NEVER use dollar signs ($) or LaTeX math delimiters ($...$ or $...$). Write all formulas, equations, and variables as plain text or inline code in backticks (e.g. `n! = n * (n-1)!`, `0! = 1`, `F(0) = 0`).\n"
+                                "3. Socratic Breakdown: Guide the student step-by-step through the thought process:\n"
+                                "   - What is the Base Case (stopping condition to prevent stack overflow or infinite loops)?\n"
+                                "   - What is the Recursive Step (recurrence relation to break the problem into smaller subproblems)?\n"
+                                "4. Pseudocode & Skeleton: Provide pseudocode, algorithm logic, or a code skeleton with blanks/TODO comments only (e.g. `// TODO: write base condition here`).\n"
+                                "5. Guiding Questions: Ask 1-2 targeted Socratic questions encouraging the student to implement the missing parts and reply with their solution.\n"
+                                "6. Citations: Reference the provided Course Materials [1..N] where relevant. If not available, rely on standard computer science principles without apologizing or saying documents are missing.\n"
+                                "7. Tone & Language: Enthusiastic, supportive, pedagogical. Always respond in the exact language of the user's question (e.g. English if asked in English, Vietnamese if asked in Vietnamese)."
+                            )
                         )
                 elif roadmap_chunk is not None:
                     reading_message = f"Found syllabus roadmap in {roadmap_chunk.title}"
@@ -889,19 +1091,19 @@ async def stream_chat(
                         )
                         messages[0] = SystemMessage(
                             content=(
-                            "You are an Academic Socratic Tutor for this course.\n"
-                            "The student is asking for help with their homework, lab assignment, or asking you to write code for an exercise.\n\n"
-                            "STRICT PEDAGOGICAL / ANTI-CHEATING RULES:\n"
-                            "1. ABSOLUTELY NO COMPLETE CODE: Under NO circumstances should you provide complete, copy-pasteable, runnable code or full function implementations (such as a complete recursive factorial function or main() method). Never write the final answer for the student.\n"
-                            "2. Concept Explanation: Explain mathematical concepts clearly. NEVER use dollar signs ($) or LaTeX math delimiters ($...$ or $...$). Write all formulas, equations, and variables as plain text or inline code in backticks (e.g. `n! = n * (n-1)!`, `0! = 1`, `F(0) = 0`).\n"
-                            "3. Socratic Breakdown: Guide the student step-by-step through the thought process:\n"
-                            "   - What is the Base Case (stopping condition to prevent stack overflow or infinite loops)?\n"
-                            "   - What is the Recursive Step (recurrence relation to break the problem into smaller subproblems)?\n"
-                            "4. Pseudocode & Skeleton: Provide pseudocode, algorithm logic, or a code skeleton with blanks/TODO comments only (e.g. `// TODO: write base condition here`).\n"
-                            "5. Guiding Questions: Ask 1-2 targeted Socratic questions encouraging the student to implement the missing parts and reply with their solution.\n"
-                            "6. Citations: Reference the provided Course Materials [1..N] where relevant. If not available, rely on standard computer science principles without apologizing or saying documents are missing.\n"
-                            "7. Tone & Language: Enthusiastic, supportive, pedagogical. Always respond in the exact language of the user's question (e.g. English if asked in English, Vietnamese if asked in Vietnamese)."
-                        )
+                                "You are an Academic Socratic Tutor for this course.\n"
+                                "The student is asking for help with their homework, lab assignment, or asking you to write code for an exercise.\n\n"
+                                "STRICT PEDAGOGICAL / ANTI-CHEATING RULES:\n"
+                                "1. ABSOLUTELY NO COMPLETE CODE: Under NO circumstances should you provide complete, copy-pasteable, runnable code or full function implementations (such as a complete recursive factorial function or main() method). Never write the final answer for the student.\n"
+                                "2. Concept Explanation: Explain mathematical concepts clearly. NEVER use dollar signs ($) or LaTeX math delimiters ($...$ or $...$). Write all formulas, equations, and variables as plain text or inline code in backticks (e.g. `n! = n * (n-1)!`, `0! = 1`, `F(0) = 0`).\n"
+                                "3. Socratic Breakdown: Guide the student step-by-step through the thought process:\n"
+                                "   - What is the Base Case (stopping condition to prevent stack overflow or infinite loops)?\n"
+                                "   - What is the Recursive Step (recurrence relation to break the problem into smaller subproblems)?\n"
+                                "4. Pseudocode & Skeleton: Provide pseudocode, algorithm logic, or a code skeleton with blanks/TODO comments only (e.g. `// TODO: write base condition here`).\n"
+                                "5. Guiding Questions: Ask 1-2 targeted Socratic questions encouraging the student to implement the missing parts and reply with their solution.\n"
+                                "6. Citations: Reference the provided Course Materials [1..N] where relevant. If not available, rely on standard computer science principles without apologizing or saying documents are missing.\n"
+                                "7. Tone & Language: Enthusiastic, supportive, pedagogical. Always respond in the exact language of the user's question (e.g. English if asked in English, Vietnamese if asked in Vietnamese)."
+                            )
                         )
                     else:
                         fallback_text = chat_retrieval_service.NO_DOCUMENT_EVIDENCE_MESSAGE
@@ -909,12 +1111,17 @@ async def stream_chat(
             elif action == "code_help":
                 reading_message = "Analyzing student code"
                 slide_chunks = [
-                    c for c in (decision.chunks or [])
+                    c
+                    for c in (decision.chunks or [])
                     if c.score is not None and c.score >= (decision.unrelated_threshold or 0.35)
                 ]
                 if not slide_chunks:
                     try:
-                        search_q = f"{class_name} C++ pointer reference" if ("ptr" in student_code or "*" in student_code) else f"{class_name} {standalone_question or 'programming syntax reference'}"
+                        search_q = (
+                            f"{class_name} C++ pointer reference"
+                            if ("ptr" in student_code or "*" in student_code)
+                            else f"{class_name} {standalone_question or 'programming syntax reference'}"
+                        )
                         web_results = await asyncio.to_thread(rag_service.search_internet, search_q)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("Web search for code help failed: %s", exc)
@@ -968,23 +1175,34 @@ async def stream_chat(
                 web_results = await asyncio.to_thread(rag_service.search_internet, web_query)
 
                 slide_chunks = [
-                    c for c in (decision.chunks or [])
+                    c
+                    for c in (decision.chunks or [])
                     if c.score is not None and c.score >= (decision.unrelated_threshold or 0.35)
                 ]
                 if not web_results and not slide_chunks:
                     fallback_text = rag_service.NO_SOURCE_MESSAGE
                 else:
-                    slide_context = _course_context(slide_chunks) if slide_chunks else "(No course slides matched)"
-                    preview_slide_citations = rag_service.curriculum_citations(slide_chunks) if slide_chunks else []
+                    slide_context = (
+                        _course_context(slide_chunks)
+                        if slide_chunks
+                        else "(No course slides matched)"
+                    )
+                    preview_slide_citations = (
+                        rag_service.curriculum_citations(slide_chunks) if slide_chunks else []
+                    )
                     preview_web_citations = (
-                        rag_service.internet_citations(web_results, start_index=len(preview_slide_citations) + 1)
+                        rag_service.internet_citations(
+                            web_results, start_index=len(preview_slide_citations) + 1
+                        )
                         if web_results
                         else []
                     )
                     web_context = (
                         "\n\n".join(
                             f"[{source.index}] ({source.title}):\n{result.content}"
-                            for source, result in zip(preview_web_citations, web_results, strict=True)
+                            for source, result in zip(
+                                preview_web_citations, web_results, strict=True
+                            )
                         )
                         if web_results
                         else "(No external search results found)"
@@ -1041,14 +1259,15 @@ async def stream_chat(
                     gap_priority,
                     is_unverified,
                 )
-                search_label = "Searching web for algorithm reference" if is_hw else "Searching the web"
-                yield _progress("searching", search_label)
-                web_results = await asyncio.to_thread(
-                    rag_service.search_internet, web_query
+                search_label = (
+                    "Searching web for algorithm reference" if is_hw else "Searching the web"
                 )
+                yield _progress("searching", search_label)
+                web_results = await asyncio.to_thread(rag_service.search_internet, web_query)
                 if not web_results:
                     substantive = [
-                        c for c in (decision.chunks or [])
+                        c
+                        for c in (decision.chunks or [])
                         if c.score is not None and c.score >= (decision.unrelated_threshold or 0.40)
                     ]
                     if substantive:
@@ -1140,8 +1359,12 @@ async def stream_chat(
                 )
                 if not _is_syllabus_relevant_question(standalone_question, verdict):
                     filtered_suggestion_chunks = [
-                        c for c in base_suggestions_chunks
-                        if not (c.title and ("syllabus" in c.title.lower() or "roadmap" in c.title.lower()))
+                        c
+                        for c in base_suggestions_chunks
+                        if not (
+                            c.title
+                            and ("syllabus" in c.title.lower() or "roadmap" in c.title.lower())
+                        )
                     ]
                     chunks_for_suggestions = filtered_suggestion_chunks or base_suggestions_chunks
                 else:
@@ -1152,13 +1375,31 @@ async def stream_chat(
                     else standalone_question
                 )
 
-                detected_lang = detect_query_language(clean_message or standalone_question or message)
+                detected_lang = detect_query_language(
+                    clean_message or standalone_question or message
+                )
                 _enforce_language(messages, detected_lang)
                 logger.info(
                     "Language mandate applied: class=%s detected=%s query='%s'",
                     class_id,
                     detected_lang,
                     (clean_message or standalone_question or message)[:80],
+                )
+
+                stage = "token budget validation"
+                messages, slide_chunks, web_results = await _apply_token_budget(
+                    db, messages, slide_chunks, web_results, context_history
+                )
+                # Suggestions must see the same retained evidence as the answer.
+                chunks_for_suggestions = (
+                    slide_chunks
+                    or [
+                        rag_service.ScoredChunk(
+                            content=r.content, score=1.0, metadata={"title": r.title, "url": r.url}
+                        )
+                        for r in web_results
+                    ]
+                    or code_fallback_chunks
                 )
 
                 stage = f"{action} answer generation"
@@ -1195,9 +1436,14 @@ async def stream_chat(
             full_answer = "".join(answer_parts)
             sources = []
 
-            if slide_chunks and full_answer and full_answer not in (
-                chat_retrieval_service.NO_DOCUMENT_EVIDENCE_MESSAGE,
-                rag_service.NO_SOURCE_MESSAGE,
+            if (
+                slide_chunks
+                and full_answer
+                and full_answer
+                not in (
+                    chat_retrieval_service.NO_DOCUMENT_EVIDENCE_MESSAGE,
+                    rag_service.NO_SOURCE_MESSAGE,
+                )
             ):
                 page_citations = rag_service.cited_page_citations(
                     slide_chunks,
@@ -1212,7 +1458,8 @@ async def stream_chat(
                     and is_high_zone
                 ):
                     high_scoring = [
-                        c for c in slide_chunks
+                        c
+                        for c in slide_chunks
                         if c.score is not None and c.score >= (decision.threshold or 0.70)
                     ]
                     if high_scoring:
@@ -1222,16 +1469,23 @@ async def stream_chat(
 
             if web_results and full_answer and full_answer != rag_service.NO_SOURCE_MESSAGE:
                 web_citations = rag_service.internet_citations(
-                    web_results, start_index=len(sources) + 1
+                    web_results, start_index=len(slide_chunks) + 1
                 )
                 used_markers = rag_service.cited_markers(full_answer)
                 matched_web = [s for s in web_citations if s.index in used_markers]
                 if not matched_web:
-                    answer_words = citation_service._content_words(full_answer) - citation_service._GENERIC_MATCH_WORDS
+                    answer_words = (
+                        citation_service._content_words(full_answer)
+                        - citation_service._GENERIC_MATCH_WORDS
+                    )
                     substantive_web = [
-                        s for s in web_citations
+                        s
+                        for s in web_citations
                         if bool(
-                            (citation_service._content_words(f"{s.title} {s.snippet or ''}") - citation_service._GENERIC_MATCH_WORDS)
+                            (
+                                citation_service._content_words(f"{s.title} {s.snippet or ''}")
+                                - citation_service._GENERIC_MATCH_WORDS
+                            )
                             & answer_words
                         )
                     ]
@@ -1254,9 +1508,14 @@ async def stream_chat(
                     followup_questions = []
 
             # Guaranteed follow-up questions
-            if not followup_questions and full_answer and full_answer not in (
-                chat_retrieval_service.NO_DOCUMENT_EVIDENCE_MESSAGE,
-                rag_service.NO_SOURCE_MESSAGE,
+            if (
+                not followup_questions
+                and full_answer
+                and full_answer
+                not in (
+                    chat_retrieval_service.NO_DOCUMENT_EVIDENCE_MESSAGE,
+                    rag_service.NO_SOURCE_MESSAGE,
+                )
             ):
                 followup_questions = suggestion_service.build_fallback_followups(
                     question=message,
@@ -1268,7 +1527,10 @@ async def stream_chat(
                 yield _sse("suggestions", {"questions": followup_questions})
 
             citation_payload = [_citation_dict(source) for source in sources]
-            used_web = action in ("web_search", "docs_plus_web") or decision.source == rag_service.SOURCE_INTERNET
+            used_web = (
+                action in ("web_search", "docs_plus_web")
+                or decision.source == rag_service.SOURCE_INTERNET
+            )
 
             fallback_reason: str | None = None
             if used_web:
@@ -1289,7 +1551,9 @@ async def stream_chat(
             else:
                 concept_tag = standalone_question[:50]
 
-            trace_steps["pedagogy"] = f"pedagogy:{_tag_pedagogy(message, student_code, scope_decision, action)}"
+            trace_steps["pedagogy"] = (
+                f"pedagogy:{_tag_pedagogy(message, student_code, scope_decision, action)}"
+            )
             saved_turn = await _persist_turn(
                 db=db,
                 user_id=user_id,
@@ -1344,6 +1608,11 @@ async def stream_chat(
                     "suggested_questions": followup_questions,
                 },
             )
+
+    except token_budget_service.TokenBudgetError as exc:
+        if suggestion_task is not None:
+            suggestion_task.cancel()
+        yield _sse("error", {"message": str(exc)})
 
     except TimeoutError:
         if suggestion_task is not None:

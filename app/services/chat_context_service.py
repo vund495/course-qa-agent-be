@@ -267,6 +267,22 @@ def format_history_context(
     return "\n\n".join(blocks)
 
 
+def answer_history_blocks(
+    exchanges: Sequence[ConversationExchange],
+    *,
+    max_chars: int | None = None,
+) -> list[str]:
+    """Return whole exchanges inside the legacy character cap, without parsing text."""
+    cap = settings.chat_context_max_chars if max_chars is None else max_chars
+    blocks = [
+        format_history_context([item], max_chars=len(item.user) + len(item.assistant) + 100)
+        for item in exchanges
+    ]
+    while blocks and len("\n\n".join(blocks)) > cap:
+        blocks.pop(0)
+    return blocks
+
+
 def _class_context_label(
     class_name: str | None,
     class_description: str | None,

@@ -11,7 +11,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.services import gemini_key_service
+from app.services import gemini_key_service, token_budget_service
 from app.services.llm.exceptions import LlmConnectionError
 from app.services.llm.provider import get_llm_model
 
@@ -42,9 +42,7 @@ def _select_key(
 ) -> gemini_key_service.ResolvedGeminiKey | None:
     """Resolve a key, preferring one that is not already streaming."""
 
-    preferred = preferred_id or _last_good_keys.get(
-        gemini_key_service.model_id(model)
-    )
+    preferred = preferred_id or _last_good_keys.get(gemini_key_service.model_id(model))
     if avoid_sticky:
         skip = excluded | _busy_keys | {preferred}
     else:
@@ -112,11 +110,7 @@ def _mark_failure(
 
 
 def _auto_switch_enabled(db: Session, auto_switch: bool | None) -> bool:
-    return (
-        auto_switch
-        if auto_switch is not None
-        else gemini_key_service.get_auto_switch(db)
-    )
+    return auto_switch if auto_switch is not None else gemini_key_service.get_auto_switch(db)
 
 
 def _candidate_models(model: str, allow_fallback: bool) -> list[str]:
@@ -143,10 +137,15 @@ async def _open_stream(
     model: str,
     messages: Sequence[Any],
     timeout: float,
+    max_output_tokens: int | None = None,
 ) -> tuple[Any, str]:
     """Start a stream and wait for its first chunk (or fail fast)."""
 
-    llm = get_llm_model(model=model, api_key=resolved.api_key)
+    llm = get_llm_model(
+        model=model,
+        api_key=resolved.api_key,
+        **({"max_output_tokens": max_output_tokens} if max_output_tokens is not None else {}),
+    )
     stream = llm.astream(messages).__aiter__()
     try:
         first = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
@@ -163,6 +162,8 @@ async def astream_chat(
     model: str | None = None,
     allow_fallback: bool = True,
     first_chunk_timeout: float = FIRST_CHUNK_TIMEOUT_SECONDS,
+    validated_model: str | None = None,
+    max_output_tokens: int | None = None,
     auto_switch: bool | None = None,
 ) -> AsyncIterator[str | StreamRestart]:
     """Stream a chat answer with key rotation.
@@ -177,7 +178,31 @@ async def astream_chat(
     deadline = time.monotonic() + FIRST_TOKEN_BUDGET_SECONDS
     attempt = 0
 
+    allowance = (
+        getattr(messages, "token_allowance", None) or token_budget_service.CountingAllowance()
+    )
     for current_model in _candidate_models(primary_model, allow_fallback):
+        if max_output_tokens is not None and current_model != validated_model:
+            counter = await token_budget_service.open_counter(
+                db, current_model, allowance=allowance
+            )
+            try:
+                count = await counter.count(token_budget_service.prompt_text(messages))
+                ceiling = min(
+                    token_budget_service.settings.chat_input_max_tokens,
+                    counter.input_limit
+                    - max_output_tokens
+                    - token_budget_service.settings.chat_token_safety_margin,
+                )
+                if (
+                    max_output_tokens > counter.output_limit
+                    or count > ceiling
+                ):
+                    raise token_budget_service.TokenBudgetError(
+                        "The chat context exceeds the fallback model token budget. Please shorten the question."
+                    )
+            finally:
+                await counter.client.aclose()
         excluded: set[Any] = set()
         while True:
             remaining = deadline - time.monotonic()
@@ -194,7 +219,17 @@ async def astream_chat(
 
             tasks: dict[Any, Any] = {}
             primary_task = asyncio.create_task(
-                _open_stream(primary, current_model, messages, attempt_timeout)
+                _open_stream(
+                    primary,
+                    current_model,
+                    messages,
+                    attempt_timeout,
+                    **(
+                        {"max_output_tokens": max_output_tokens}
+                        if max_output_tokens is not None
+                        else {}
+                    ),
+                )
             )
             tasks[primary_task] = primary
 
@@ -262,9 +297,7 @@ async def astream_chat(
             primary = resolved
             _record_success(db, primary)
             if primary.key_id is not None:
-                _last_good_keys[gemini_key_service.model_id(current_model)] = (
-                    primary.key_id
-                )
+                _last_good_keys[gemini_key_service.model_id(current_model)] = primary.key_id
                 _busy_keys.add(primary.key_id)
 
             restart = False
@@ -325,9 +358,7 @@ def invoke_chat(
                     session,
                     model=current_model,
                     exclude_ids=excluded,
-                    preferred_id=_last_good_keys.get(
-                        gemini_key_service.model_id(current_model)
-                    ),
+                    preferred_id=_last_good_keys.get(gemini_key_service.model_id(current_model)),
                 )
                 if resolved is None:
                     break
