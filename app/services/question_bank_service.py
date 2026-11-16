@@ -34,6 +34,7 @@ from app.schemas.question_bank import (
     MisconceptionGenRequest,
 )
 from app.services.llm.provider import get_llm_model
+from app.services.question_grounding import check_grounding, measure_lengths
 from app.services.quiz_excel import (
     FILL_IN_BLANK_ANSWERS_KEY,
     export_quiz_to_workbook,
@@ -319,6 +320,25 @@ def bulk_update_status(
     return len(questions)
 
 
+def _load_material_text(document_ids: list[uuid.UUID]) -> dict[str, str]:
+    """Read indexed chunk text for the given documents, tolerating Qdrant outages.
+
+    AI-200: the generation prompt needs the real material so the model can stay
+    grounded and so ``source_reference`` can be checked. A Qdrant failure must not
+    break generation outright, so it degrades to an empty map and the caller falls
+    back to the file-name-only snippet.
+    """
+    if not document_ids:
+        return {}
+    try:
+        from app.services.vector_store.qdrant_store import fetch_document_chunks
+
+        return fetch_document_chunks([str(d) for d in document_ids])
+    except Exception as exc:  # noqa: BLE001 - retrieval is best-effort here
+        logger.warning("Could not load document text for quiz generation: %s", exc)
+        return {}
+
+
 def generate_questions_from_documents(
     db: Session,
     class_id: uuid.UUID,
@@ -358,8 +378,15 @@ def generate_questions_from_documents(
     primary_doc_id: uuid.UUID | None = None
     if docs:
         primary_doc_id = docs[0].id
+        material = _load_material_text([d.id for d in docs[:5]])
         for doc in docs[:5]:
-            doc_snippets.append(f"Document '{doc.file_name}':\n[Type: {doc.file_type}, Status: {doc.status}]")
+            body = material.get(str(doc.id))
+            if body:
+                doc_snippets.append(f"Document '{doc.file_name}':\n{body}")
+            else:
+                doc_snippets.append(
+                    f"Document '{doc.file_name}':\n[Type: {doc.file_type}, Status: {doc.status}]"
+                )
     else:
         doc_snippets.append(f"Course syllabus & core modules for: {clazz.name} ({clazz.code})")
 
@@ -414,8 +441,36 @@ def generate_questions_from_documents(
     data = json.loads(json_match.group(0))
     questions_data = data.get("questions", [])
 
+    # AI-200: prompt wording cannot guarantee grounding, so every item is checked
+    # against the material that was actually sent. Ungrounded items never reach
+    # the bank; the reason is logged so a bad batch is diagnosable.
+    length_report = measure_lengths(questions_data)
+    if length_report.out_of_range:
+        logger.warning(
+            "Quiz generation length spread %s; out of range: %s",
+            length_report.as_dict(),
+            "; ".join(length_report.out_of_range),
+        )
+    if length_report.answer_cue:
+        logger.warning(
+            "Quiz generation answer cues: %s", "; ".join(length_report.answer_cue)
+        )
+
+    grounded_items: list[dict[str, Any]] = []
+    for index, item in enumerate(questions_data):
+        result = check_grounding(item, document_content)
+        if not result.grounded:
+            logger.warning(
+                "Rejected generated question %s (skill=%s): %s",
+                index,
+                item.get("skill_code"),
+                result.reason,
+            )
+            continue
+        grounded_items.append(item)
+
     created_questions: list[BankQuestion] = []
-    for item in questions_data:
+    for item in grounded_items:
         q_type = str(item.get("question_type", "SINGLE_CHOICE")).upper()
         if q_type not in ("SINGLE_CHOICE", "MULTIPLE_CHOICE", "FILL_IN_BLANK"):
             q_type = "SINGLE_CHOICE"
