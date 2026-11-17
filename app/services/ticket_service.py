@@ -236,9 +236,15 @@ def add_trainer_reply(
     trainer_id: uuid.UUID,
     message: str,
 ) -> TicketReply | None:
+    """Answer a ticket; a trainer may post several replies in a row.
+
+    Once the first answer lands the ticket is ANSWERED. Further trainer replies
+    are allowed while it is ANSWERED (for example to add a correction or a
+    second explanation) and keep it ANSWERED until the student confirms.
+    """
     expire_open_tickets(db)
     ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
-    if ticket is None or ticket.status != "OPEN":
+    if ticket is None or ticket.status not in ("OPEN", "ANSWERED"):
         return None
     if ticket.class_id not in class_ids_for_trainer(db, trainer_id, active_only=True):
         raise PermissionError("You are not assigned to this class.")

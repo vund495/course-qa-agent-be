@@ -26,6 +26,6 @@ from app.models.quiz import (  # noqa: F401
 )
 from app.models.skill import Skill  # noqa: F401
 from app.models.system_config import SystemConfig  # noqa: F401
-from app.models.ticket import Ticket, TicketReply  # noqa: F401
+from app.models.ticket import Ticket, TicketAttachment, TicketReply  # noqa: F401
 from app.models.usage import ChatDailyUsage  # noqa: F401
 from app.models.user import Account, Permission, Role, RolePermission, User  # noqa: F401

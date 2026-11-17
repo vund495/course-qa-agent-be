@@ -233,6 +233,11 @@ class Settings(BaseSettings):
         default=Path(__file__).resolve().parents[2] / "storage" / "documents",
         validation_alias="DOCUMENT_STORAGE_DIR",
     )
+    # Images students/trainers attach to ticket replies (AI-89 follow-up media).
+    ticket_storage_dir: Path = Field(
+        default=Path(__file__).resolve().parents[2] / "storage" / "tickets",
+        validation_alias="TICKET_STORAGE_DIR",
+    )
 
     @property
     def smtp_sender(self) -> str:
