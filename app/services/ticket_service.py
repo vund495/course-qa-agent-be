@@ -32,6 +32,9 @@ def _owned_by_trainer(trainer_id: uuid.UUID):
 
     Tickets created before the owner column existed fall back to the primary
     trainer of their class, which is who the student sent them to.
+
+    Teaching assistants skip this filter: they support every class they are
+    enrolled in, so they see the class tickets their trainer owns.
     """
     return or_(
         Ticket.owner_trainer_id == trainer_id,
@@ -247,11 +250,20 @@ def add_trainer_reply(
     ticket_id: uuid.UUID,
     trainer_id: uuid.UUID,
     message: str,
+    class_wide: bool = False,
 ) -> TicketReply | None:
+    """Answer a ticket; a trainer may post several replies in a row.
+
+    Once the first answer lands the ticket is ANSWERED. Further trainer replies
+    are allowed while it is ANSWERED (for example to add a correction or a
+    second explanation) and keep it ANSWERED until the student confirms.
+    """
     # get_trainer_ticket enforces class access and ownership, so a colleague
     # cannot answer a ticket that belongs to another trainer.
-    ticket = get_trainer_ticket(db, ticket_id=ticket_id, trainer_id=trainer_id)
-    if ticket is None or ticket.status != "OPEN":
+    ticket = get_trainer_ticket(
+        db, ticket_id=ticket_id, trainer_id=trainer_id, class_wide=class_wide
+    )
+    if ticket is None or ticket.status not in ("OPEN", "ANSWERED"):
         return None
     if escalate_stale_tickets(db, class_ids={ticket.class_id}):
         db.refresh(ticket)
@@ -265,12 +277,13 @@ def add_trainer_reply(
 
 
 def get_trainer_ticket(
-    db: Session, *, ticket_id: uuid.UUID, trainer_id: uuid.UUID
+    db: Session, *, ticket_id: uuid.UUID, trainer_id: uuid.UUID, class_wide: bool = False
 ) -> Ticket | None:
     """Return a ticket only to the trainer it was sent to.
 
     Class access is still required (archived classes stay closed), and another
-    trainer's ticket is rejected instead of being silently shared.
+    trainer's ticket is rejected instead of being silently shared. Teaching
+    assistants pass ``class_wide`` because they support the whole class.
     """
     expire_open_tickets(db)
     ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
@@ -279,7 +292,7 @@ def get_trainer_ticket(
     clazz = db.query(Class).filter(Class.id == ticket.class_id).first()
     if clazz is None or clazz.id not in class_ids_for_trainer(db, trainer_id, active_only=True):
         raise PermissionError("You are not assigned to this class.")
-    if (ticket.owner_trainer_id or clazz.trainer_id) != trainer_id:
+    if not class_wide and (ticket.owner_trainer_id or clazz.trainer_id) != trainer_id:
         raise PermissionError("This ticket belongs to another trainer.")
     return ticket
 
@@ -297,10 +310,12 @@ def resolve_student_ticket(
 
 
 def resolve_trainer_ticket(
-    db: Session, *, ticket_id: uuid.UUID, trainer_id: uuid.UUID
+    db: Session, *, ticket_id: uuid.UUID, trainer_id: uuid.UUID, class_wide: bool = False
 ) -> Ticket | None:
     """AC-01: the assigned trainer marks an open or answered ticket as resolved."""
-    ticket = get_trainer_ticket(db, ticket_id=ticket_id, trainer_id=trainer_id)
+    ticket = get_trainer_ticket(
+        db, ticket_id=ticket_id, trainer_id=trainer_id, class_wide=class_wide
+    )
     if ticket is None or ticket.status not in RESOLVABLE_STATUSES:
         return None
     ticket.status = "RESOLVED"
@@ -340,6 +355,7 @@ def ticket_counts_for_trainer(
     *,
     trainer_id: uuid.UUID,
     class_id: uuid.UUID | None = None,
+    class_wide: bool = False,
 ) -> list[TicketClassCounts]:
     """AC-03: open/completed ticket totals for each class the trainer teaches."""
     expire_open_tickets(db)
@@ -357,13 +373,14 @@ def ticket_counts_for_trainer(
         .all()
     )
     active_ids = [clazz.id for clazz in classes]
-    rows = (
+    counts_query = (
         db.query(Ticket.class_id, Ticket.status, func.count(Ticket.id))
         .join(Class, Ticket.class_id == Class.id)
-        .filter(Ticket.class_id.in_(active_ids), _owned_by_trainer(trainer_id))
-        .group_by(Ticket.class_id, Ticket.status)
-        .all()
+        .filter(Ticket.class_id.in_(active_ids))
     )
+    if not class_wide:
+        counts_query = counts_query.filter(_owned_by_trainer(trainer_id))
+    rows = counts_query.group_by(Ticket.class_id, Ticket.status).all()
     by_status: dict[uuid.UUID, dict[str, int]] = {}
     for ticket_class_id, status, count in rows:
         by_status.setdefault(ticket_class_id, {})[status] = count
@@ -429,6 +446,7 @@ def list_trainer_tickets(
     status: TicketStatus | None = None,
     page: int = 1,
     page_size: int = 20,
+    class_wide: bool = False,
 ) -> tuple[list[TicketInboxItem], int]:
     expire_open_tickets(db)
     assigned = class_ids_for_trainer(db, trainer_id, active_only=True)
@@ -443,8 +461,10 @@ def list_trainer_tickets(
         db.query(Ticket, User.full_name, Class.name, Class.code, Class.status)
         .join(User, Ticket.student_id == User.id)
         .join(Class, Ticket.class_id == Class.id)
-        .filter(Ticket.class_id.in_(scope), _owned_by_trainer(trainer_id))
+        .filter(Ticket.class_id.in_(scope))
     )
+    if not class_wide:
+        query = query.filter(_owned_by_trainer(trainer_id))
     if status is not None:
         query = query.filter(Ticket.status == status)
     total = query.count()
