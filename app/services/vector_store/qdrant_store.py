@@ -3,6 +3,7 @@
 import copy
 import logging
 import uuid
+from collections.abc import Sequence
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -75,6 +76,80 @@ def delete_points_by_document_id(
     found = client.count(collection_name=collection_name, count_filter=selector, exact=True).count
     client.delete(collection_name=collection_name, points_selector=selector, wait=True)
     return found
+
+
+def fetch_document_chunks(
+    document_ids: Sequence[str],
+    *,
+    max_chars_per_document: int = 20000,
+    url: str | None = None,
+    collection_name: str | None = None,
+    api_key: str | None = None,
+    client: QdrantClient | None = None,
+) -> dict[str, str]:
+    """Return the indexed text of each document, keyed by document id.
+
+    AI-200 needs the real material text so the generation prompt can be grounded
+    and ``source_reference`` can be checked against something. The chunks are
+    already in Qdrant, so this reads them back instead of re-parsing the uploaded
+    files (the PDF loader pulls in heavyweight models). Documents with no chunks
+    are absent from the result; the text of each document is capped at
+    ``max_chars_per_document`` so one large file cannot flood the prompt.
+    """
+    wanted = [str(d) for d in document_ids]
+    if not wanted:
+        return {}
+
+    url = url or settings.qdrant_url
+    collection_name = collection_name or settings.collection_name
+    api_key = api_key if api_key is not None else settings.qdrant_api_key
+    if not url or not collection_name:
+        raise ValueError("qdrant_url and collection_name must be configured.")
+
+    client = client or QdrantClient(url=url, api_key=api_key)
+    if not client.collection_exists(collection_name):
+        return {}
+
+    selector = Filter(
+        should=[
+            FieldCondition(
+                key="metadata.document_id",
+                match=MatchValue(value=doc_id),
+            )
+            for doc_id in wanted
+        ]
+    )
+
+    texts: dict[str, list[str]] = {doc_id: [] for doc_id in wanted}
+    sizes: dict[str, int] = {doc_id: 0 for doc_id in wanted}
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=selector,
+            limit=128,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for point in points:
+            payload = point.payload or {}
+            metadata = payload.get("metadata") or {}
+            doc_id = str(metadata.get("document_id", ""))
+            if doc_id not in texts:
+                continue
+            if sizes[doc_id] >= max_chars_per_document:
+                continue
+            content = payload.get("page_content") or ""
+            if not isinstance(content, str) or not content.strip():
+                continue
+            remaining = max_chars_per_document - sizes[doc_id]
+            texts[doc_id].append(content[:remaining])
+            sizes[doc_id] += min(len(content), remaining)
+        if offset is None:
+            break
+
+    return {doc_id: "\n\n".join(parts) for doc_id, parts in texts.items() if parts}
 
 
 def clone_document_points(

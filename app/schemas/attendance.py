@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 AttendanceStatus = Literal["present", "late", "excused_absence", "unexcused_absence"]
 SessionStatus = Literal["scheduled", "cancelled", "rescheduled"]
+HolidayType = Literal["solar", "lunar", "admin"]
+HolidayScope = Literal["system", "class"]
 
 
 class ClassScheduleCreate(BaseModel):
@@ -48,7 +50,28 @@ class ClassScheduleRead(BaseModel):
     effective_to: date | None
 
 
-class ClassSessionRead(BaseModel):
+class SessionTrainerLeaveRead(BaseModel):
+    """Approved leave affecting a dated session."""
+
+    id: uuid.UUID
+    date_from: date
+    date_to: date
+    reason_type: str | None = None
+    reason_details: str | None = None
+    target_trainer_id: uuid.UUID | None = None
+    target_trainer_name: str | None = None
+
+
+class SessionCalendarFlags(BaseModel):
+    """Live calendar warnings; these do not alter persisted session status."""
+
+    is_holiday: bool = False
+    holiday_name: str | None = None
+    trainer_on_leave: bool = False
+    trainer_leave: SessionTrainerLeaveRead | None = None
+
+
+class ClassSessionRead(SessionCalendarFlags):
     """Response DTO representing a materialised dated class session."""
 
     model_config = ConfigDict(from_attributes=True)
@@ -181,4 +204,41 @@ class StudentAttendanceRead(BaseModel):
     attended: int
     attendance_rate: float | None = None
     items: list[StudentAttendanceItem]
+
+
+class StudentScheduleSessionRead(SessionCalendarFlags):
+    """One dated class session as seen by an enrolled student (AI-157)."""
+
+    id: uuid.UUID
+    date: date
+    start_at: datetime
+    end_at: datetime
+    subject: str
+    trainer_name: str | None = None
+    status: SessionStatus
+    attendance_status: AttendanceStatus | None = None
+    attendance_note: str | None = None
+
+
+class StudentScheduleHolidayRead(BaseModel):
+    """A holiday that falls inside the requested student schedule range."""
+
+    date: date
+    name: str
+    type: HolidayType
+    scope: HolidayScope
+
+
+class StudentScheduleRead(BaseModel):
+    """Weekly/monthly student schedule plus holidays and own attendance status."""
+
+    class_id: uuid.UUID
+    class_code: str
+    class_name: str
+    date_from: date
+    date_to: date
+    today: date
+    meeting_url: str | None = None
+    sessions: list[StudentScheduleSessionRead]
+    holidays: list[StudentScheduleHolidayRead]
 

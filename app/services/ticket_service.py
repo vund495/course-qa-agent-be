@@ -4,15 +4,19 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import exists, func, or_, update
+from sqlalchemy import and_, exists, func, or_, update
 from sqlalchemy.orm import Session
 
 from app.models.course import Class, ClassTrainer, Enrollment
 from app.models.system_config import SystemConfig
 from app.models.ticket import Ticket, TicketReply
 from app.models.user import User
+from app.schemas.handover import AdminQueueItem
 from app.schemas.tickets import TicketClassCounts, TicketInboxItem, TicketStatus
-from app.services.course_service import class_ids_for_trainer
+from app.services.availability_service import is_available
+from app.services.course_service import class_ids_for_ticket_staff as class_ids_for_trainer
+from app.services.course_service import list_trainers
+from app.services.handover_service import sweep_for_trainer
 from app.services.holiday_service import business_elapsed, holiday_dates, local_date
 from app.services.user_service import role_name_of
 
@@ -23,13 +27,29 @@ MAX_TICKET_ESCALATION_SLA_HOURS = int(TICKET_EXPIRATION.total_seconds() // 3600)
 RESOLVABLE_STATUSES = ("OPEN", "ANSWERED")
 
 
+def _owned_by_trainer(trainer_id: uuid.UUID):
+    """Only the trainer a ticket was sent to sees it in their inbox (AI-83).
+
+    Tickets created before the owner column existed fall back to the primary
+    trainer of their class, which is who the student sent them to.
+
+    Teaching assistants skip this filter: they support every class they are
+    enrolled in, so they see the class tickets their trainer owns.
+    """
+    return or_(
+        Ticket.owner_trainer_id == trainer_id,
+        and_(Ticket.owner_trainer_id.is_(None), Class.trainer_id == trainer_id),
+    )
+
+
 def expire_open_tickets(db: Session, *, now: datetime | None = None) -> int:
-    """Expire unanswered tickets after seven days from creation."""
+    """Expire unanswered tickets after seven days, except queued-for-admin ones."""
     cutoff = (now or datetime.now(UTC)) - TICKET_EXPIRATION
     result = db.execute(
         update(Ticket)
         .where(
             Ticket.status == "OPEN",
+            Ticket.queued_for_admin_at.is_(None),
             func.coalesce(Ticket.reopened_at, Ticket.created_at) <= cutoff,
         )
         .values(status="EXPIRED")
@@ -79,10 +99,11 @@ def escalate_stale_tickets(
 ) -> int:
     """Escalate each open ticket past the holiday-aware SLA once.
 
-    The SQL cutoff is the wall-clock lower bound (a ticket that is not old
-    enough in wall-clock terms cannot be stale in business time either). The
-    final decision removes full Vietnam holiday days from the elapsed window,
-    so holidays do not consume the SLA (AI-156 AC-04).
+    Tickets waiting for an administrator are skipped so queue time does not
+    consume the escalation SLA. The SQL cutoff is the wall-clock lower bound
+    (a ticket that is not old enough in wall-clock terms cannot be stale in
+    business time either). The final decision removes full Vietnam holiday days
+    from the elapsed window, so holidays do not consume the SLA (AI-156 AC-04).
 
     ``class_ids`` limits the sweep to the classes the caller can already see, so
     reading one ticket never walks every stale ticket in the database.
@@ -94,6 +115,7 @@ def escalate_stale_tickets(
     cutoff = moment - sla
     query = db.query(Ticket).filter(
         Ticket.status == "OPEN",
+        Ticket.queued_for_admin_at.is_(None),
         func.coalesce(Ticket.reopened_at, Ticket.created_at) <= cutoff,
         Ticket.escalated_at.is_(None),
     )
@@ -164,6 +186,7 @@ def create_student_ticket(
         agent_answer=agent_answer,
         citations=citations or [],
         source_message_id=source_message_id,
+        owner_trainer_id=clazz.trainer_id,
     )
     db.add(ticket)
     db.flush()
@@ -171,10 +194,17 @@ def create_student_ticket(
         db.add(TicketReply(ticket_id=ticket.id, user_id=student.id, message=details))
     db.commit()
     db.refresh(ticket)
+
+    today = local_date(datetime.now(UTC))
+    if not is_available(db, clazz.trainer_id, today):
+        sweep_for_trainer(db, clazz.trainer_id, today)
+        db.refresh(ticket)
     return ticket
 
 
-def get_student_ticket(db: Session, *, ticket_id: uuid.UUID, student_id: uuid.UUID) -> Ticket | None:
+def get_student_ticket(
+    db: Session, *, ticket_id: uuid.UUID, student_id: uuid.UUID
+) -> Ticket | None:
     expire_open_tickets(db)
     ticket = (
         db.query(Ticket)
@@ -220,13 +250,21 @@ def add_trainer_reply(
     ticket_id: uuid.UUID,
     trainer_id: uuid.UUID,
     message: str,
+    class_wide: bool = False,
 ) -> TicketReply | None:
-    expire_open_tickets(db)
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
-    if ticket is None or ticket.status != "OPEN":
+    """Answer a ticket; a trainer may post several replies in a row.
+
+    Once the first answer lands the ticket is ANSWERED. Further trainer replies
+    are allowed while it is ANSWERED (for example to add a correction or a
+    second explanation) and keep it ANSWERED until the student confirms.
+    """
+    # get_trainer_ticket enforces class access and ownership, so a colleague
+    # cannot answer a ticket that belongs to another trainer.
+    ticket = get_trainer_ticket(
+        db, ticket_id=ticket_id, trainer_id=trainer_id, class_wide=class_wide
+    )
+    if ticket is None or ticket.status not in ("OPEN", "ANSWERED"):
         return None
-    if ticket.class_id not in class_ids_for_trainer(db, trainer_id, active_only=True):
-        raise PermissionError("You are not assigned to this class.")
     if escalate_stale_tickets(db, class_ids={ticket.class_id}):
         db.refresh(ticket)
 
@@ -239,15 +277,23 @@ def add_trainer_reply(
 
 
 def get_trainer_ticket(
-    db: Session, *, ticket_id: uuid.UUID, trainer_id: uuid.UUID
+    db: Session, *, ticket_id: uuid.UUID, trainer_id: uuid.UUID, class_wide: bool = False
 ) -> Ticket | None:
-    """Return a ticket only when it belongs to one of the trainer's classes."""
+    """Return a ticket only to the trainer it was sent to.
+
+    Class access is still required (archived classes stay closed), and another
+    trainer's ticket is rejected instead of being silently shared. Teaching
+    assistants pass ``class_wide`` because they support the whole class.
+    """
     expire_open_tickets(db)
     ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
     if ticket is None:
         return None
-    if ticket.class_id not in class_ids_for_trainer(db, trainer_id, active_only=True):
+    clazz = db.query(Class).filter(Class.id == ticket.class_id).first()
+    if clazz is None or clazz.id not in class_ids_for_trainer(db, trainer_id, active_only=True):
         raise PermissionError("You are not assigned to this class.")
+    if not class_wide and (ticket.owner_trainer_id or clazz.trainer_id) != trainer_id:
+        raise PermissionError("This ticket belongs to another trainer.")
     return ticket
 
 
@@ -264,10 +310,12 @@ def resolve_student_ticket(
 
 
 def resolve_trainer_ticket(
-    db: Session, *, ticket_id: uuid.UUID, trainer_id: uuid.UUID
+    db: Session, *, ticket_id: uuid.UUID, trainer_id: uuid.UUID, class_wide: bool = False
 ) -> Ticket | None:
     """AC-01: the assigned trainer marks an open or answered ticket as resolved."""
-    ticket = get_trainer_ticket(db, ticket_id=ticket_id, trainer_id=trainer_id)
+    ticket = get_trainer_ticket(
+        db, ticket_id=ticket_id, trainer_id=trainer_id, class_wide=class_wide
+    )
     if ticket is None or ticket.status not in RESOLVABLE_STATUSES:
         return None
     ticket.status = "RESOLVED"
@@ -307,6 +355,7 @@ def ticket_counts_for_trainer(
     *,
     trainer_id: uuid.UUID,
     class_id: uuid.UUID | None = None,
+    class_wide: bool = False,
 ) -> list[TicketClassCounts]:
     """AC-03: open/completed ticket totals for each class the trainer teaches."""
     expire_open_tickets(db)
@@ -324,12 +373,14 @@ def ticket_counts_for_trainer(
         .all()
     )
     active_ids = [clazz.id for clazz in classes]
-    rows = (
+    counts_query = (
         db.query(Ticket.class_id, Ticket.status, func.count(Ticket.id))
+        .join(Class, Ticket.class_id == Class.id)
         .filter(Ticket.class_id.in_(active_ids))
-        .group_by(Ticket.class_id, Ticket.status)
-        .all()
     )
+    if not class_wide:
+        counts_query = counts_query.filter(_owned_by_trainer(trainer_id))
+    rows = counts_query.group_by(Ticket.class_id, Ticket.status).all()
     by_status: dict[uuid.UUID, dict[str, int]] = {}
     for ticket_class_id, status, count in rows:
         by_status.setdefault(ticket_class_id, {})[status] = count
@@ -351,23 +402,40 @@ def ticket_counts_for_trainer(
     return counts
 
 
+def _build_inbox_item(row) -> TicketInboxItem:
+    ticket, student_name, class_name, class_code, class_status = row
+    return TicketInboxItem(
+        id=ticket.id,
+        class_id=ticket.class_id,
+        student_id=ticket.student_id,
+        question=ticket.question,
+        original_question=ticket.original_question,
+        status=ticket.status,
+        created_at=ticket.created_at,
+        agent_answer=ticket.agent_answer,
+        citations=ticket.citations,
+        source_message_id=ticket.source_message_id,
+        escalated_to_id=ticket.escalated_to_id,
+        escalated_at=ticket.escalated_at,
+        escalated_to_name=ticket.escalated_to_name,
+        student_seen_at=ticket.student_seen_at,
+        owner_trainer_id=ticket.owner_trainer_id,
+        owner_trainer_name=ticket.owner_trainer_name,
+        queued_for_admin_at=ticket.queued_for_admin_at,
+        handover_from_id=ticket.handover_from_id,
+        handover_from_name=ticket.handover_from_name,
+        handover_reason=ticket.handover_reason,
+        handover_at=ticket.handover_at,
+        student_name=student_name,
+        class_name=class_name,
+        class_code=class_code,
+        class_status=class_status or "ACTIVE",
+        replies=ticket.replies,
+    )
+
+
 def _inbox_items(rows) -> list[TicketInboxItem]:
-    return [
-        TicketInboxItem(
-            id=ticket.id, class_id=ticket.class_id, student_id=ticket.student_id,
-            question=ticket.question, original_question=ticket.original_question,
-            status=ticket.status, created_at=ticket.created_at,
-            agent_answer=ticket.agent_answer,
-            citations=ticket.citations, source_message_id=ticket.source_message_id,
-            escalated_to_id=ticket.escalated_to_id, escalated_at=ticket.escalated_at,
-            escalated_to_name=ticket.escalated_to_name,
-            student_seen_at=ticket.student_seen_at,
-            student_name=student_name, class_name=class_name, class_code=class_code,
-            class_status=class_status or "ACTIVE",
-            replies=ticket.replies,
-        )
-        for ticket, student_name, class_name, class_code, class_status in rows
-    ]
+    return [_build_inbox_item(row) for row in rows]
 
 
 def list_trainer_tickets(
@@ -378,12 +446,16 @@ def list_trainer_tickets(
     status: TicketStatus | None = None,
     page: int = 1,
     page_size: int = 20,
+    class_wide: bool = False,
 ) -> tuple[list[TicketInboxItem], int]:
     expire_open_tickets(db)
     assigned = class_ids_for_trainer(db, trainer_id, active_only=True)
     if class_id is not None and class_id not in assigned:
         raise PermissionError("You are not assigned to this class.")
     scope = {class_id} if class_id is not None else assigned
+    today = local_date(datetime.now(UTC))
+    if not is_available(db, trainer_id, today):
+        sweep_for_trainer(db, trainer_id, today)
     escalate_stale_tickets(db, class_ids=scope)
     query = (
         db.query(Ticket, User.full_name, Class.name, Class.code, Class.status)
@@ -391,6 +463,8 @@ def list_trainer_tickets(
         .join(Class, Ticket.class_id == Class.id)
         .filter(Ticket.class_id.in_(scope))
     )
+    if not class_wide:
+        query = query.filter(_owned_by_trainer(trainer_id))
     if status is not None:
         query = query.filter(Ticket.status == status)
     total = query.count()
@@ -401,6 +475,80 @@ def list_trainer_tickets(
         .all()
     )
     return _inbox_items(rows), total
+
+
+def _absent_trainer_names(db: Session, class_id: uuid.UUID, day) -> list[str]:
+    trainers = list_trainers(db, class_id)
+    return [item["name"] for item in trainers if not is_available(db, item["trainer_id"], day)]
+
+
+def list_admin_queue(db: Session) -> list[AdminQueueItem]:
+    """Return every ticket waiting for an administrator, oldest first."""
+    expire_open_tickets(db)
+    today = local_date(datetime.now(UTC))
+    rows = (
+        db.query(Ticket, User.full_name, Class.name, Class.code, Class.status)
+        .join(User, Ticket.student_id == User.id)
+        .join(Class, Ticket.class_id == Class.id)
+        .filter(
+            Ticket.queued_for_admin_at.isnot(None),
+            Ticket.status.in_(("OPEN", "ANSWERED")),
+        )
+        .order_by(Ticket.queued_for_admin_at.asc(), Ticket.id.asc())
+        .all()
+    )
+    items: list[AdminQueueItem] = []
+    for row in rows:
+        item = _build_inbox_item(row)
+        items.append(
+            AdminQueueItem(
+                **item.model_dump(),
+                absent_trainers=_absent_trainer_names(db, item.class_id, today),
+            )
+        )
+    return items
+
+
+def get_admin_ticket(db: Session, ticket_id: uuid.UUID) -> Ticket | None:
+    """Return any non-archived ticket for an administrator."""
+    expire_open_tickets(db)
+    return (
+        db.query(Ticket)
+        .join(Class, Ticket.class_id == Class.id)
+        .filter(Ticket.id == ticket_id, Class.status != "ARCHIVED")
+        .first()
+    )
+
+
+def add_admin_reply(
+    db: Session,
+    *,
+    ticket_id: uuid.UUID,
+    admin_id: uuid.UUID,
+    message: str,
+) -> TicketReply | None:
+    """Admin reply to an open ticket; it also leaves the admin queue."""
+    ticket = get_admin_ticket(db, ticket_id)
+    if ticket is None or ticket.status != "OPEN":
+        return None
+    reply = TicketReply(ticket_id=ticket.id, user_id=admin_id, message=message)
+    db.add(reply)
+    ticket.status = "ANSWERED"
+    ticket.queued_for_admin_at = None
+    db.commit()
+    db.refresh(reply)
+    return reply
+
+
+def resolve_admin_ticket(db: Session, *, ticket_id: uuid.UUID) -> Ticket | None:
+    ticket = get_admin_ticket(db, ticket_id)
+    if ticket is None or ticket.status not in RESOLVABLE_STATUSES:
+        return None
+    ticket.status = "RESOLVED"
+    ticket.queued_for_admin_at = None
+    db.commit()
+    db.refresh(ticket)
+    return ticket
 
 
 def list_student_tickets(
@@ -430,7 +578,10 @@ def list_student_tickets(
             exists().where(
                 TicketReply.ticket_id == Ticket.id,
                 TicketReply.user_id != Ticket.student_id,
-                or_(Ticket.student_seen_at.is_(None), TicketReply.created_at > Ticket.student_seen_at),
+                or_(
+                    Ticket.student_seen_at.is_(None),
+                    TicketReply.created_at > Ticket.student_seen_at,
+                ),
             )
         )
     total = query.count()

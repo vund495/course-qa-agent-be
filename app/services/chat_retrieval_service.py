@@ -130,7 +130,35 @@ def retrieve_for_chat(
             except Exception:
                 logger.warning("English rerank expansion failed; proceeding with base reranked chunks.", exc_info=True)
 
-        chunks = ranked_candidates[:RERANK_TOP_K]
+        selected_chunks = list(ranked_candidates[:RERANK_TOP_K])
+        # Sibling continuity: if a top-scoring chunk belongs to a multi-chunk section,
+        # pull its sibling chunks from the remaining candidates so complete lists/sections
+        # are not fragmented across chunks.
+        included_contents = {c.content for c in selected_chunks}
+        for top_c in list(selected_chunks):
+            if top_c.score is not None and top_c.score >= threshold_high:
+                top_sec = (top_c.metadata or {}).get("section_path")
+                top_doc = (top_c.metadata or {}).get("document_id")
+                if top_sec and top_doc:
+                    for sibling in ranked_candidates[RERANK_TOP_K:]:
+                        sib_meta = sibling.metadata or {}
+                        if (
+                            sib_meta.get("document_id") == top_doc
+                            and sib_meta.get("section_path") == top_sec
+                            and sibling.content not in included_contents
+                        ):
+                            selected_chunks.append(sibling)
+                            included_contents.add(sibling.content)
+
+        # Sort chunks in natural document reading order for coherent LLM context
+        chunks = sorted(
+            selected_chunks,
+            key=lambda c: (
+                str((c.metadata or {}).get("document_id", "")),
+                c.page if c.page is not None else 0,
+                (c.metadata or {}).get("chunk_index", 0),
+            ),
+        )
         cluster_count = count_clusters(ranked_candidates, (threshold_high + threshold_low) / 2.0)
         margin = calculate_margin(ranked_candidates)
     except Exception:

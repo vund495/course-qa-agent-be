@@ -214,3 +214,20 @@ def test_local_date_uses_vietnam_timezone():
     moment = datetime(2026, 11, 4, 17, 0, tzinfo=UTC)
 
     assert local_date(moment) == date(2026, 11, 5)
+
+
+def test_explicit_seed_does_not_restore_deleted_defaults(db_session):
+    seed_holidays(db_session, [2026])
+    db_session.delete(get_holiday(db_session, date(2026, 9, 2)))
+    db_session.commit()
+    assert seed_holidays(db_session, [2026]) == 0
+    assert get_holiday(db_session, date(2026, 9, 2)) is None
+
+
+def test_year_rollover_does_not_restore_previously_seeded_next_year(db_session):
+    seed_holidays(db_session, today=date(2026, 6, 1))
+    db_session.delete(get_holiday(db_session, date(2027, 9, 2)))
+    db_session.commit()
+    seed_holidays(db_session, today=date(2027, 1, 1))
+    assert get_holiday(db_session, date(2027, 9, 2)) is None
+    assert get_holiday(db_session, date(2028, 9, 2)) is not None

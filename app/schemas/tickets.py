@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 TicketStatus = Literal["OPEN", "ANSWERED", "RESOLVED", "EXPIRED"]
 
@@ -35,15 +35,34 @@ class TicketCreate(BaseModel):
 
 
 class TicketReplyCreate(BaseModel):
-    message: str = Field(min_length=1, max_length=10000)
+    message: str = Field(default="", max_length=10000)
+    # Uploaded first via POST /api/tickets/{id}/attachments, then bound here.
+    attachment_ids: list[uuid.UUID] = Field(default_factory=list, max_length=3)
 
     @field_validator("message")
     @classmethod
     def normalize_message(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def require_body(self) -> TicketReplyCreate:
+        if not self.message and not self.attachment_ids:
             raise ValueError("Message must not be empty.")
-        return cleaned
+        return self
+
+
+class TicketAttachmentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    ticket_id: uuid.UUID
+    reply_id: uuid.UUID | None = None
+    kind: Literal["IMAGE", "EMOJI"]
+    file_name: str | None = None
+    mime_type: str | None = None
+    size_bytes: int | None = None
+    emoji: str | None = None
+    created_at: datetime
 
 
 class TicketReplyRead(BaseModel):
@@ -52,8 +71,12 @@ class TicketReplyRead(BaseModel):
     id: uuid.UUID
     ticket_id: uuid.UUID
     user_id: uuid.UUID
+    # Display name of whoever wrote the reply, so a thread can show a TA or an
+    # administrator instead of assuming the ticket owner answered.
+    author_name: str | None = None
     message: str
     created_at: datetime
+    attachments: list[TicketAttachmentRead] = Field(default_factory=list)
 
 
 class TicketRead(BaseModel):
@@ -73,6 +96,13 @@ class TicketRead(BaseModel):
     escalated_at: datetime | None = None
     escalated_to_name: str | None = None
     student_seen_at: datetime | None = None
+    owner_trainer_id: uuid.UUID | None = None
+    owner_trainer_name: str | None = None
+    queued_for_admin_at: datetime | None = None
+    handover_from_id: uuid.UUID | None = None
+    handover_from_name: str | None = None
+    handover_reason: str | None = None
+    handover_at: datetime | None = None
 
 
 class TicketThreadRead(TicketRead):

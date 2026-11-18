@@ -17,39 +17,44 @@ question-bank-gen-prompt:
     3. Distractors in multiple choice questions must be plausible technical misconceptions, not silly or obvious false choices.
     4. Provide clear, in-depth explanations detailing why the correct answer is true and why the distractors are incorrect.
     5. Language: Output must be written strictly in professional English.
+    6. Grounding: Every question must be answerable from the supplied Source Document Content alone. Do not introduce facts, APIs, libraries, syntax, examples, or terminology that do not appear in that content. If the material does not cover a requested skill or difficulty level, generate fewer questions rather than inventing material.
+    7. Source reference: `source_reference` must name a section, heading, or topic that literally exists in the supplied Source Document Content. Never invent a plausible-sounding title.
+    8. Equal length: Keep every question stem between 60 and 160 characters, and every answer option between 15 and 70 characters. All items in one batch must stay within these ranges so no question is easier or harder merely because it is longer. Count characters and shorten before answering. Exception: when the answer is a technical identifier that cannot be padded without becoming wrong or meaningless (a library header such as `<vector>`, a keyword, an operator, a function name), use the identifier as-is and keep the other options in that item equally short.
+    9. Balanced options: The correct option must not be longer, more detailed, or more qualified than the distractors. All four options must have comparable length and specificity, so the correct answer cannot be identified by its shape alone. Put the detail in `explanation`, never in the correct option text.
 
     Output format:
-    Return ONLY a valid JSON object matching this exact schema:
+    Return ONLY a valid JSON object matching this exact schema. The values below are
+    placeholders showing the shape of each field, not content to reuse:
     {
       "questions": [
         {
-          "skill_code": "CPP_POINTERS",
+          "skill_code": "<CODE_FROM_TARGET_SKILLS>",
           "question_type": "SINGLE_CHOICE",
           "difficulty": "NOVICE",
-          "question": "Which operator is used to access the memory address of an existing variable in C++?",
+          "question": "<one sentence, 60-160 characters, answerable from the material>",
           "points": 1.0,
           "options": [
-            {"option_label": "A", "option_text": "Address-of operator (&)", "is_correct": true},
-            {"option_label": "B", "option_text": "Dereference operator (*)", "is_correct": false},
-            {"option_label": "C", "option_text": "Arrow operator (->)", "is_correct": false},
-            {"option_label": "D", "option_text": "Scope resolution operator (::)", "is_correct": false}
+            {"option_label": "A", "option_text": "<15-70 characters>", "is_correct": true},
+            {"option_label": "B", "option_text": "<15-70 characters>", "is_correct": false},
+            {"option_label": "C", "option_text": "<15-70 characters>", "is_correct": false},
+            {"option_label": "D", "option_text": "<15-70 characters>", "is_correct": false}
           ],
           "correct_answers": [],
-          "explanation": "The ampersand (&) precedes a variable name to return its memory address. The asterisk (*) dereferences a pointer.",
-          "rubric": "Recall of basic memory operator syntax.",
-          "source_reference": "Pointers and Memory Basics"
+          "explanation": "<why the correct answer holds, and why each distractor fails>",
+          "rubric": "<the rubric level this item measures>",
+          "source_reference": "<section or heading copied from the material>"
         },
         {
-          "skill_code": "CPP_POINTERS",
+          "skill_code": "<CODE_FROM_TARGET_SKILLS>",
           "question_type": "FILL_IN_BLANK",
           "difficulty": "BEGINNER",
-          "question": "What C++ keyword is used to deallocate dynamic memory allocated with the new operator for a single object?",
+          "question": "<one sentence, 60-160 characters, answerable from the material>",
           "points": 1.0,
           "options": [],
-          "correct_answers": ["delete", "delete operator"],
-          "explanation": "The delete keyword frees heap memory previously allocated with new. For arrays, delete[] must be used.",
-          "rubric": "Exact match for deallocation keyword.",
-          "source_reference": "Dynamic Memory Management"
+          "correct_answers": ["<accepted answer>", "<accepted variant>"],
+          "explanation": "<why this answer is the one the material supports>",
+          "rubric": "<the rubric level this item measures>",
+          "source_reference": "<section or heading copied from the material>"
         }
       ]
     }

@@ -76,6 +76,17 @@ Multi-file material upload (Upload AC-04); each file validated independently (AC
 - Fake content (e.g. `.exe` renamed to `.pdf`) → per-file error `content is not a real PDF file`.
 - Oversize → per-file error `exceeds 100MB per file` (AC-01).
 
+### 2.3. Relevance validation policy (2026-11-12)
+
+- Trainer uploads skip the AI course-relevance check: the trainer owns the class
+  topic and is responsible for the material they add.
+- Admin uploads keep the AI relevance gate. The `force=true` query remains a
+  bypass and the response contract (`document` / `error` / `warning`) is
+  unchanged.
+- Non-AI guards are unchanged: file type/size and real-content validation,
+  authentication, class ownership, syllabus parsing/format checks, and the
+  pending → approve → index flow.
+
 ## 3. Implementation Plan
 
 ### 3.1. Schemas (`app/schemas/documents.py`)

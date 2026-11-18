@@ -20,8 +20,8 @@ from sqlalchemy.pool import StaticPool
 
 from app import models  # noqa: F401
 from app.core.database import Base
-from app.models.attendance import Attendance, ClassSession
-from app.models.course import Class, Enrollment
+from app.models.attendance import Attendance, ClassSession, Holiday
+from app.models.course import Class, ClassInfo, Enrollment
 from app.models.user import Role, User
 from app.schemas.attendance import AttendanceRecordUpdate
 from app.services import attendance_service
@@ -550,3 +550,185 @@ def test_student_history_rejects_non_enrolled_student(db_session):
         attendance_service.get_student_history(
             db_session, clazz, student.id, date(2026, 11, 1), date(2026, 11, 10), today=today
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. get_student_schedule tests (AI-157)
+# ---------------------------------------------------------------------------
+
+
+def test_student_schedule_includes_future_sessions_holidays_and_own_status(db_session):
+    trainer = _make_user(
+        db_session,
+        "trainer_schedule@academic.edu.vn",
+        role_name="trainer",
+        full_name="Schedule Trainer",
+    )
+    student1 = _make_user(db_session, "s1_schedule@academic.edu.vn")
+    student2 = _make_user(db_session, "s2_schedule@academic.edu.vn")
+    clazz = _make_class(db_session, trainer, code="CS213", name="Algorithms")
+
+    db_session.add_all(
+        [
+            Enrollment(class_id=clazz.id, student_id=student1.id, status="ACTIVE"),
+            Enrollment(class_id=clazz.id, student_id=student2.id, status="ACTIVE"),
+            ClassInfo(
+                class_id=clazz.id,
+                meeting_url="https://meet.example.com/algorithms",
+            ),
+            Holiday(date=date(2026, 11, 4), name="Class holiday", type="admin", scope="class", class_id=clazz.id),
+        ]
+    )
+    db_session.commit()
+
+    past = _make_session(db_session, clazz, date(2026, 11, 2), trainer)
+    future = _make_session(db_session, clazz, date(2026, 11, 9), trainer)
+    cancelled = _make_session(db_session, clazz, date(2026, 11, 6), trainer, status="cancelled")
+
+    db_session.add_all(
+        [
+            Attendance(
+                class_session_id=past.id,
+                student_id=student1.id,
+                status="present",
+                note="On time",
+                recorded_by=trainer.id,
+            ),
+            Attendance(
+                class_session_id=past.id,
+                student_id=student2.id,
+                status="late",
+                note="Another student's private note",
+                recorded_by=trainer.id,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    schedule = attendance_service.get_student_schedule(
+        db_session,
+        clazz,
+        student1.id,
+        date(2026, 11, 1),
+        date(2026, 11, 10),
+        today=date(2026, 11, 5),
+    )
+
+    assert schedule.class_id == clazz.id
+    assert schedule.class_code == "CS213"
+    assert schedule.class_name == "Algorithms"
+    assert schedule.today == date(2026, 11, 5)
+    assert schedule.meeting_url == "https://meet.example.com/algorithms"
+
+    assert [s.id for s in schedule.sessions] == [past.id, cancelled.id, future.id]
+    past_dto = schedule.sessions[0]
+    assert past_dto.subject == "Algorithms"
+    assert past_dto.trainer_name == "Schedule Trainer"
+    assert past_dto.attendance_status == "present"
+    assert past_dto.attendance_note == "On time"
+
+    assert schedule.sessions[1].status == "cancelled"
+    assert schedule.sessions[1].attendance_status is None
+
+    assert schedule.sessions[2].id == future.id
+    assert schedule.sessions[2].attendance_status is None
+
+    assert len(schedule.holidays) == 1
+    assert schedule.holidays[0].date == date(2026, 11, 4)
+    assert schedule.holidays[0].name == "Class holiday"
+    assert schedule.holidays[0].type == "admin"
+    assert schedule.holidays[0].scope == "class"
+
+    # Never leak another student's attendance note.
+    assert all("Another student's private note" not in (s.attendance_note or "") for s in schedule.sessions)
+
+
+def test_student_schedule_rejects_non_enrolled_student(db_session):
+    trainer = _make_user(db_session, "trainer_schedule_noenroll@academic.edu.vn", role_name="trainer")
+    student = _make_user(db_session, "s_schedule_noenroll@academic.edu.vn")
+    clazz = _make_class(db_session, trainer, code="CS214")
+
+    with pytest.raises(StudentNotInRosterError, match="not an active enrolled member"):
+        attendance_service.get_student_schedule(
+            db_session, clazz, student.id, date(2026, 11, 1), date(2026, 11, 10)
+        )
+
+
+@pytest.fixture()
+def assistant_roster(db_session):
+    trainer = _make_user(db_session, "trainer@assistant-roster.test", role_name="TRAINER")
+    student = _make_user(db_session, "student@assistant-roster.test", role_name="STUDENT")
+    assistant = _make_user(
+        db_session, "assistant@assistant-roster.test", role_name="TEACHING_ASSISTANT"
+    )
+    clazz = _make_class(db_session, trainer, code="ASSISTANT-ROSTER")
+    day = date(2026, 11, 12)
+    session = _make_session(db_session, clazz, day, trainer)
+    db_session.add_all(
+        [
+            Enrollment(class_id=clazz.id, student_id=user.id, status="ACTIVE")
+            for user in (student, assistant)
+        ]
+    )
+    db_session.add(
+        Attendance(
+            class_session_id=session.id,
+            student_id=assistant.id,
+            status="present",
+            recorded_by=trainer.id,
+        )
+    )
+    db_session.commit()
+    return clazz, trainer, student, assistant, session, day
+
+
+def test_attendance_sheet_excludes_enrolled_assistant_and_old_marks(db_session, assistant_roster):
+    clazz, _, student, _, session, _ = assistant_roster
+    sheet = attendance_service.get_sheet(db_session, clazz, session.id)
+    assert [record.student_id for record in sheet.records] == [student.id]
+    assert sheet.session.student_count == 1
+    assert sheet.session.marked_count == 0
+    assert sheet.summary.present == 0
+    assert sheet.summary.unmarked == 1
+
+
+def test_attendance_summary_excludes_enrolled_assistant(db_session, assistant_roster):
+    clazz, _, student, _, _, day = assistant_roster
+    summary = attendance_service.get_summary(db_session, clazz, day, day, today=day)
+    assert [row.student_id for row in summary.students] == [student.id]
+
+
+def test_attendance_save_rejects_enrolled_assistant(db_session, assistant_roster):
+    clazz, trainer, _, assistant, session, day = assistant_roster
+    with pytest.raises(StudentNotInRosterError):
+        attendance_service.save_sheet(
+            db_session,
+            clazz,
+            session.id,
+            [AttendanceRecordUpdate(student_id=assistant.id, status="late")],
+            trainer.id,
+            today=day,
+        )
+
+
+def test_schedule_counts_exclude_assistant_enrollment_and_old_marks(db_session, assistant_roster):
+    from app.schemas.attendance import SessionCreate
+    from app.services import schedule_service
+
+    clazz, trainer, _, _, _, day = assistant_roster
+    sessions = schedule_service.list_sessions(db_session, clazz, day, day)
+    assert sessions[0].student_count == 1
+    assert sessions[0].marked_count == 0
+    created = schedule_service.create_ad_hoc_session(
+        db_session, clazz, SessionCreate(date=day, start_time=time(13), end_time=time(15)), trainer
+    )
+    assert created.student_count == 1
+
+
+@pytest.mark.parametrize(
+    "fetch", [attendance_service.get_student_history, attendance_service.get_student_schedule]
+)
+def test_student_attendance_views_reject_enrolled_assistant(db_session, assistant_roster, fetch):
+    clazz, _, _, assistant, _, day = assistant_roster
+    with pytest.raises(StudentNotInRosterError):
+        fetch(db_session, clazz, assistant.id, day, day, today=day)

@@ -15,6 +15,7 @@ from app.core.database import get_session_local, init_engine
 from app.core.deps import get_db
 from app.core.logging import configure_logging
 from app.core.seed import seed_database
+from app.routers import holidays
 from app.routers.admin.router import router as admin_router
 from app.routers.attendance import (
     router as attendance_router,
@@ -29,6 +30,7 @@ from app.routers.citations.router import router as citations_router
 from app.routers.class_config import router as class_config_router
 from app.routers.content_gaps import router as content_gaps_router
 from app.routers.documents import router as documents_router
+from app.routers.handover import router as handover_router
 from app.routers.history import router as history_router
 from app.routers.question_bank import router as question_bank_router
 from app.routers.quizzes import router as quizzes_router
@@ -87,6 +89,8 @@ def _expire_tickets_once() -> int:
 
     session_local = get_session_local(settings.database_url)
     with session_local() as db:
+        from app.services.leave_service import activate_approved_leaves
+        activate_approved_leaves(db)
         return expire_open_tickets(db)
 
 
@@ -125,6 +129,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Per-Epic routers land here as sprints progress.
@@ -147,6 +152,7 @@ app.include_router(categories_router)
 app.include_router(content_gaps_router)
 app.include_router(attendance_router)
 app.include_router(attendance_student_router)
+app.include_router(handover_router)
 
 
 
@@ -161,3 +167,6 @@ def health_check(db: Session = Depends(get_db)):
     """
 
     return build_health(db, settings, live_llm=False)
+
+
+app.include_router(holidays.router, prefix="/api")

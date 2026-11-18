@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import ClassVar, Literal
 
-from pydantic import AliasChoices, EmailStr, Field, SecretStr, field_validator
+from pydantic import AliasChoices, EmailStr, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -187,6 +187,16 @@ class Settings(BaseSettings):
         le=60.0,
         validation_alias="SERPAPI_TIMEOUT_SECONDS",
     )
+    serpapi_verify_urls: bool = Field(
+        default=True,
+        validation_alias="SERPAPI_VERIFY_URLS",
+    )
+    serpapi_url_probe_timeout: float = Field(
+        default=2.0,
+        ge=0.5,
+        le=10.0,
+        validation_alias="SERPAPI_URL_PROBE_TIMEOUT",
+    )
 
     # DB-backed auth (E1 / AI-25, AI-27, AI-31). Dev defaults only — override in prod.
     jwt_secret: str = Field(
@@ -223,6 +233,11 @@ class Settings(BaseSettings):
         default=Path(__file__).resolve().parents[2] / "storage" / "documents",
         validation_alias="DOCUMENT_STORAGE_DIR",
     )
+    # Images students/trainers attach to ticket replies (AI-89 follow-up media).
+    ticket_storage_dir: Path = Field(
+        default=Path(__file__).resolve().parents[2] / "storage" / "tickets",
+        validation_alias="TICKET_STORAGE_DIR",
+    )
 
     @property
     def smtp_sender(self) -> str:
@@ -256,16 +271,39 @@ class Settings(BaseSettings):
 
     # AI-63 conversation memory: keep the last N complete Q&A exchanges.
     chat_context_exchanges: int = Field(
-        default=5,
+        default=20,
         ge=1,
         le=20,
         validation_alias="CHAT_CONTEXT_EXCHANGES",
     )
     chat_context_max_chars: int = Field(
-        default=6000,
+        default=30000,
         ge=500,
         le=30000,
         validation_alias="CHAT_CONTEXT_MAX_CHARS",
+    )
+
+    # AI-190 answer prompt token budgets.
+    chat_input_max_tokens: int = Field(
+        default=24000, ge=1, validation_alias="CHAT_INPUT_MAX_TOKENS"
+    )
+    chat_system_max_tokens: int = Field(
+        default=6000, ge=1, validation_alias="CHAT_SYSTEM_MAX_TOKENS"
+    )
+    chat_history_max_tokens: int = Field(
+        default=4000, ge=1, validation_alias="CHAT_HISTORY_MAX_TOKENS"
+    )
+    chat_documents_max_tokens: int = Field(
+        default=12000, ge=1, validation_alias="CHAT_DOCUMENTS_MAX_TOKENS"
+    )
+    chat_answer_max_tokens: int = Field(
+        default=4000, ge=1, validation_alias="CHAT_ANSWER_MAX_TOKENS"
+    )
+    chat_token_safety_margin: int = Field(
+        default=1000, ge=1, validation_alias="CHAT_TOKEN_SAFETY_MARGIN"
+    )
+    chat_token_count_timeout_seconds: float = Field(
+        default=5.0, gt=0, le=15, validation_alias="CHAT_TOKEN_COUNT_TIMEOUT_SECONDS"
     )
 
     # AI-125 suggested follow-up questions
@@ -348,6 +386,20 @@ class Settings(BaseSettings):
         validation_alias="PROMPT_FILE",
     )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+
+    @model_validator(mode="after")
+    def validate_chat_token_budgets(self):
+        """Section caps cannot exceed the total input cap."""
+        if any(
+            value > self.chat_input_max_tokens
+            for value in (
+                self.chat_system_max_tokens,
+                self.chat_history_max_tokens,
+                self.chat_documents_max_tokens,
+            )
+        ):
+            raise ValueError("Chat section token caps must not exceed CHAT_INPUT_MAX_TOKENS")
+        return self
 
     @field_validator(
         "google_api_key",

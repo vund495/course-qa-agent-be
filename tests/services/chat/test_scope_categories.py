@@ -413,7 +413,7 @@ def test_logistics_and_roadmap_strictly_never_web_search():
     assert _determine_chat_action(decision_chunks=[], has_roadmap=True, **kwargs) == "docs"
     assert _determine_chat_action(decision_chunks=[], has_roadmap=False, **kwargs) == "safe_fallback"
 
-    # 2. Core questions with roadmap never search web even in low zone
+    # 2. Core questions: syllabus queries route to docs, technical queries in low zone search web
     core_gate = ScopeDecision(verdict="core", confidence=0.95)
     kwargs_core = {
         "has_code": False,
@@ -423,4 +423,5 @@ def test_logistics_and_roadmap_strictly_never_web_search():
         "is_low_zone": True,
         "is_hw": False,
     }
-    assert _determine_chat_action(decision_chunks=[], has_roadmap=True, **kwargs_core) == "docs"
+    assert _determine_chat_action(decision_chunks=[], has_roadmap=True, is_syllabus_q=True, **kwargs_core) == "docs"
+    assert _determine_chat_action(decision_chunks=[], has_roadmap=True, is_syllabus_q=False, **kwargs_core) == "web_search"

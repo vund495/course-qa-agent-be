@@ -64,6 +64,8 @@ def require_class_member_or_staff(db: Session, user: User, class_id: uuid.UUID) 
         db, user.id, active_only=True
     ):
         return clazz
+    if role == "TEACHING_ASSISTANT" and clazz.id in course_service.class_ids_for_ticket_staff(db, user.id, active_only=True):
+        return clazz
     if course_service.is_active_member(db, class_id, user.id):
         return clazz
     raise HTTPException(

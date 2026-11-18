@@ -35,6 +35,7 @@ _PAGE_NUMBER = re.compile(
     r"""^[ \t]*(?:
         [-–—_]*[ \t]*(?:page|trang)[ \t]*\d+(?:[ \t]*(?:of|/)[ \t]*\d+)?[ \t]*[-–—_]*
       | [-–—_]+[ \t]*\d+[ \t]*[-–—_]+
+      | [ivxlcdm]{1,8}
       | \d{1,4}
     )[ \t]*$\n?""",
     re.IGNORECASE | re.MULTILINE | re.VERBOSE,

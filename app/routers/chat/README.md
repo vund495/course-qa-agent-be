@@ -34,8 +34,8 @@ Configuration:
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `CHAT_CONTEXT_EXCHANGES` | `5` | Number of previous complete Q&A pairs sent to the model |
-| `CHAT_CONTEXT_MAX_CHARS` | `6000` | Character budget for the conversation-history prompt |
+| `CHAT_CONTEXT_EXCHANGES` | `20` | Maximum number of previous complete Q&A pairs considered for the prompt |
+| `CHAT_CONTEXT_MAX_CHARS` | `30000` | Character safety cap before token-budget fitting |
 | `CHAT_CLASS_CONTEXT_MAX_CHARS` | `240` | Class-description budget used to qualify a failed rewrite |
 | `CHAT_PRE_RETRIEVAL_TIMEOUT_SECONDS` | `15` | Shared gate + rewrite deadline before retrieval starts |
 

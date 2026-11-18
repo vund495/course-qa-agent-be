@@ -1,7 +1,8 @@
-"""Student attendance history router (AI-136 Phase 2).
+"""Student attendance and schedule router (AI-136 Phase 2, AI-157).
 
-Provides endpoint 9:
-9. GET /api/student/classes/{class_id}/attendance?from=&to=
+Provides endpoint 9 and the AI-157 schedule view:
+9.  GET /api/student/classes/{class_id}/attendance?from=&to=
+10. GET /api/student/classes/{class_id}/schedule?from=&to=
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.core.deps import get_current_user, get_db
 from app.models.user import User
 from app.routers.attendance.permissions import require_enrolled_student
-from app.schemas.attendance import StudentAttendanceRead
+from app.schemas.attendance import StudentAttendanceRead, StudentScheduleRead
 from app.services import attendance_service, schedule_service
 from app.services.attendance_service import StudentNotInRosterError
 from app.services.course_service import DomainError
@@ -44,6 +45,35 @@ def get_my_attendance_history(
 
     try:
         return attendance_service.get_student_history(
+            db, clazz, current_user.id, resolved_from, resolved_to
+        )
+    except StudentNotInRosterError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except DomainError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@student_router.get(
+    "/{class_id}/schedule",
+    response_model=StudentScheduleRead,
+    summary="Get caller's weekly/monthly class schedule with attendance status",
+)
+def get_my_schedule(
+    class_id: uuid.UUID,
+    date_from: date | None = Query(default=None, alias="from"),
+    date_to: date | None = Query(default=None, alias="to"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> StudentScheduleRead:
+    """Return dated sessions, holidays and the caller's own attendance status."""
+    clazz = require_enrolled_student(db, current_user, class_id)
+    try:
+        resolved_from, resolved_to = schedule_service.resolve_range(date_from, date_to)
+    except DomainError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    try:
+        return attendance_service.get_student_schedule(
             db, clazz, current_user.id, resolved_from, resolved_to
         )
     except StudentNotInRosterError as exc:

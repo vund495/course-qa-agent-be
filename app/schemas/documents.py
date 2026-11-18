@@ -1,5 +1,6 @@
 """Pydantic schemas for Epic E2: documents (AI-35/37/41)."""
 
+import uuid
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -34,6 +35,13 @@ class DocumentRead(BaseModel):
     failure_reason: str | None = None
     version: int = 1
     created_at: datetime
+    syllabus_document_id: str | None = None
+    syllabus_unit_number: int | None = None
+
+
+class AttachSyllabusMaterialRequest(BaseModel):
+    syllabus_document_id: uuid.UUID
+    unit_number: int | None = Field(default=None, ge=1)
 
 
 class DocumentDeleteResponse(BaseModel):
@@ -63,3 +71,36 @@ class DocumentListResponse(BaseModel):
     total: int = 0
     page: int = 1
     page_size: int = 20
+
+class SyllabusMaterialRead(BaseModel):
+    """One material attached to a syllabus unit (AI-166)."""
+
+    id: str
+    file_name: str
+    status: str
+    failure_reason: str | None = None
+    version: int = 1
+    created_at: datetime
+
+
+class TeacherSyllabusUnitRead(BaseModel):
+    unit_number: int
+    unit_title: str
+    description: str | None = None
+    content: str
+    materials: list[SyllabusMaterialRead] = Field(default_factory=list)
+
+
+class TeacherSyllabusRead(BaseModel):
+    """Teacher-only draft/active syllabus preview with per-unit materials."""
+
+    class_id: str
+    document_id: str | None = None
+    file_name: str | None = None
+    status: str | None = None
+    is_draft: bool = False
+    ready_material_count: int = 0
+    total_material_count: int = 0
+    can_approve: bool = False
+    units: list[TeacherSyllabusUnitRead] = Field(default_factory=list)
+    syllabus_materials: list[SyllabusMaterialRead] = Field(default_factory=list)

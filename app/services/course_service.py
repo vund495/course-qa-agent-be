@@ -125,9 +125,7 @@ def create_class(
     except (TypeError, ValueError):
         raise DomainError("Credits must be an integer between 1 and 6.")
     if not MIN_CLASS_CREDITS <= credits <= MAX_CLASS_CREDITS:
-        raise DomainError(
-            f"Credits must be between {MIN_CLASS_CREDITS} and {MAX_CLASS_CREDITS}."
-        )
+        raise DomainError(f"Credits must be between {MIN_CLASS_CREDITS} and {MAX_CLASS_CREDITS}.")
     tid = _coerce_uuid(trainer_id)
     trainer = db.query(User).filter(User.id == tid).first()
     if trainer is None:
@@ -279,9 +277,7 @@ def remove_trainer(db: Session, class_id: uuid.UUID | str, trainer_id: uuid.UUID
         raise DomainError("Class does not exist.")
     tid = _coerce_uuid(trainer_id)
     if tid == section.trainer_id:
-        raise DomainError(
-            "That is the primary trainer — assign a different primary trainer first."
-        )
+        raise DomainError("That is the primary trainer — assign a different primary trainer first.")
     removed = (
         db.query(ClassTrainer)
         .filter(ClassTrainer.class_id == section.id, ClassTrainer.trainer_id == tid)
@@ -626,7 +622,10 @@ def semester_credit_total(
 def check_credit_cap(db: Session, student_id: uuid.UUID | str, section: Class) -> None:
     """Hard cap: activating this enrollment must not exceed 20 credits/term."""
     total = semester_credit_total(
-        db, student_id, section.semester, section.academic_year,
+        db,
+        student_id,
+        section.semester,
+        section.academic_year,
         exclude_class_id=section.id,
     )
     if total + (section.credits or 0) > MAX_SEMESTER_CREDITS:
@@ -685,9 +684,7 @@ def set_class_prerequisites(
     return class_prerequisites(db, cid)
 
 
-def missing_prerequisites(
-    db: Session, student_id: uuid.UUID | str, section: Class
-) -> list[Class]:
+def missing_prerequisites(db: Session, student_id: uuid.UUID | str, section: Class) -> list[Class]:
     """Prerequisites of ``section`` the student has not passed yet."""
     prereqs = class_prerequisites(db, section.id)
     if not prereqs:
@@ -705,9 +702,7 @@ def missing_prerequisites(
     return [p for p in prereqs if p.id not in passed]
 
 
-def check_prerequisites(
-    db: Session, student_id: uuid.UUID | str, section: Class
-) -> None:
+def check_prerequisites(db: Session, student_id: uuid.UUID | str, section: Class) -> None:
     missing = missing_prerequisites(db, student_id, section)
     if missing:
         names = ", ".join(f"{m.code} — {m.name}" for m in missing)
@@ -744,3 +739,40 @@ def user_display_name(db: Session, user_id: uuid.UUID | str | None) -> str | Non
         return None
     user = db.query(User).filter(User.id == _coerce_uuid(user_id)).first()
     return user.full_name if user else None
+
+
+def class_ids_for_ticket_staff(
+    db: Session, user_id: uuid.UUID, active_only: bool = False
+) -> set[uuid.UUID]:
+    """Trainer classes or existing active TA enrollment; never student enrollment."""
+    ids = class_ids_for_trainer(db, user_id, active_only)
+    role = (
+        db.query(Role.name).join(User, User.role_id == Role.id).filter(User.id == user_id).scalar()
+    )
+    if role == "TEACHING_ASSISTANT":
+        query = (
+            db.query(Enrollment.class_id)
+            .join(Class, Class.id == Enrollment.class_id)
+            .filter(Enrollment.student_id == user_id, Enrollment.status == "ACTIVE")
+        )
+        if active_only:
+            query = query.filter(Class.status != STATUS_ARCHIVED)
+        ids.update(row[0] for row in query.all())
+    return ids
+
+
+def list_assistants(db: Session, class_id: uuid.UUID) -> list[User]:
+    """Return active teaching assistants enrolled in the requested class."""
+    return (
+        db.query(User)
+        .join(Role, Role.id == User.role_id)
+        .join(Enrollment, Enrollment.student_id == User.id)
+        .filter(
+            Role.name == "TEACHING_ASSISTANT",
+            User.status == "ACTIVE",
+            Enrollment.class_id == class_id,
+            Enrollment.status == "ACTIVE",
+        )
+        .order_by(User.full_name, User.id)
+        .all()
+    )

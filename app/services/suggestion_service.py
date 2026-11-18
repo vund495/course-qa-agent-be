@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.config.config import settings
 from app.core.prompt_manager import get_prompt_manager
+from app.services import language_service
 from app.services.llm import gateway
 from app.services.rag_service import ScoredChunk
 
@@ -93,7 +94,18 @@ _VIETNAMESE_CHARS = set("ăâđêôơưàáảãạằắẳẵặầấẩẫ�
 
 
 def _is_vietnamese(text: str) -> bool:
-    return any(char in _VIETNAMESE_CHARS for char in text.lower())
+    return language_service.is_vietnamese(text)
+
+
+def _extract_clean_topic(question: str) -> str:
+    cleaned = re.sub(r"[?!.,;:\"']+", "", question).strip()
+    patterns = [
+        r"^(?:write|create|implement|explain|describe|what is|what are|how to use|how does|compare|how do)\s+",
+        r"^(?:viết|hãy viết|giải thích|cho biết|hướng dẫn|thế nào là|như thế nào|so sánh|làm sao để|tìm hiểu về)\s+",
+    ]
+    for pat in patterns:
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned if len(cleaned) >= 3 else ""
 
 
 def build_fallback_followups(
@@ -106,6 +118,7 @@ def build_fallback_followups(
     results: list[str] = []
     is_vi = _is_vietnamese(question)
     q_lower = question.lower()
+    topic = _extract_clean_topic(question) or class_name or ("chủ đề này" if is_vi else "this topic")
 
     # Check if chunks have titles or topic keywords
     for chunk in chunks[:3]:
@@ -119,33 +132,63 @@ def build_fallback_followups(
                 break
 
     if is_vi:
-        if "con trỏ" in q_lower or "pointer" in q_lower or "ptr" in q_lower:
+        if any(kw in q_lower for kw in ("hello world", "chương trình đầu", "first program", "bắt đầu c++")):
+            results.append("Hàm main() đóng vai trò là điểm bắt đầu thực thi chương trình như thế nào?")
+            results.append("Sự khác biệt giữa câu lệnh cout và printf trong C++ là gì?")
+            results.append("Tại sao cần chỉ thị tiền xử lý #include <iostream> trong C++?")
+        elif any(kw in q_lower for kw in ("con trỏ", "pointer", "ptr", "bộ nhớ", "tham chiếu", "reference")):
             results.append("Sự khác biệt giữa con trỏ (pointer) và tham chiếu (reference) trong C++ là gì?")
             results.append("Làm thế nào để tránh lỗi con trỏ treo (dangling pointer) và rò rỉ bộ nhớ?")
-        elif "hàm" in q_lower or "function" in q_lower or "đệ quy" in q_lower or "recursion" in q_lower:
+            results.append("Toán tử new và delete quản lý bộ nhớ động như thế nào?")
+        elif any(kw in q_lower for kw in ("hàm", "function", "đệ quy", "recursion")):
             results.append("Điều kiện dừng (base case) quan trọng như thế nào trong hàm đệ quy?")
             results.append("Ưu và nhược điểm giữa đệ quy và vòng lặp lặp lại (iteration) là gì?")
-        elif "chữ hoa" in q_lower or "case" in q_lower or "cú pháp" in q_lower or "syntax" in q_lower:
-            results.append("Quy ước đặt tên biến và hàm phổ biến (naming conventions) trong C++ là gì?")
-            results.append("C++ có những từ khóa dành riêng (reserved keywords) nào cần tránh khi đặt tên?")
+            results.append("Cơ chế truyền tham trị và truyền tham chiếu trong hàm khác nhau thế nào?")
+        elif any(kw in q_lower for kw in ("vòng lặp", "loop", "for", "while", "do-while")):
+            results.append("Khi nào nên dùng vòng lặp for thay vì vòng lặp while?")
+            results.append("Lệnh break và continue hoạt động khác nhau như thế nào trong vòng lặp?")
+            results.append("Vòng lặp do-while khác với while ở đặc điểm cốt lõi nào?")
+        elif any(kw in q_lower for kw in ("class", "lớp", "oop", "đối tượng", "object", "kế thừa", "đa hình")):
+            results.append("Sự khác biệt giữa các quyền truy cập private, protected và public là gì?")
+            results.append("Hàm tạo (constructor) và hàm hủy (destructor) hoạt động như thế nào?")
+            results.append("Khái niệm tính đa hình (polymorphism) được triển khai thế nào trong C++?")
+        elif any(kw in q_lower for kw in ("syllabus", "roadmap", "lịch trình", "unit", "outline", "grading", "điểm")):
+            results.append("Tiêu chí và tỷ lệ tính điểm môn học được quy định như thế nào?")
+            results.append("Môn học có những yêu cầu tiên quyết nào trước khi học?")
+            results.append("Lịch trình các bài kiểm tra và bài tập lớn diễn ra khi nào?")
         else:
-            topic = class_name or "môn học này"
-            results.append(f"Những ứng dụng thực tế phổ biến nhất của chủ đề này trong {topic} là gì?")
-            results.append("Có những lỗi thường gặp (common pitfalls) nào cần lưu ý về phần này?")
+            results.append(f"Những lưu ý quan trọng và lỗi thường gặp khi làm việc với {topic} là gì?")
+            results.append(f"Có những trường hợp thực tế nào nên áp dụng {topic}?")
+            results.append(f"Làm thế nào để tối ưu hóa hiệu năng khi sử dụng {topic}?")
     else:
-        if "pointer" in q_lower or "ptr" in q_lower:
+        if any(kw in q_lower for kw in ("hello world", "first program", "getting started")):
+            results.append("How does the main() function serve as the execution entry point in C++?")
+            results.append("What is the difference between cout and printf in C++?")
+            results.append("Why is the #include <iostream> preprocessor directive required?")
+        elif any(kw in q_lower for kw in ("pointer", "ptr", "memory", "reference")):
             results.append("What is the difference between a pointer and a reference in C++?")
             results.append("How can dangling pointers and memory leaks be avoided?")
-        elif "function" in q_lower or "recursion" in q_lower or "recursive" in q_lower:
+            results.append("How do new and delete operators manage dynamic memory in C++?")
+        elif any(kw in q_lower for kw in ("function", "recursion", "recursive")):
             results.append("Why is a base case essential in a recursive function?")
             results.append("What are the advantages and trade-offs between recursion and iteration?")
-        elif "case" in q_lower or "syntax" in q_lower or "naming" in q_lower:
-            results.append("What are standard naming conventions for variables and functions in C++?")
-            results.append("Which reserved keywords should be avoided when declaring variables in C++?")
+            results.append("What is the difference between pass-by-value and pass-by-reference in C++?")
+        elif any(kw in q_lower for kw in ("loop", "for", "while", "do-while")):
+            results.append("When is it best to use a for loop instead of a while loop?")
+            results.append("How do break and continue statements behave differently in loops?")
+            results.append("How does a do-while loop differ fundamentally from a while loop?")
+        elif any(kw in q_lower for kw in ("class", "oop", "object", "inheritance", "polymorphism")):
+            results.append("What are the differences between private, protected, and public access specifiers?")
+            results.append("How do constructors and destructors work in C++?")
+            results.append("How is polymorphism implemented using virtual functions in C++?")
+        elif any(kw in q_lower for kw in ("syllabus", "roadmap", "schedule", "unit", "outline", "grading")):
+            results.append("What is the grading policy and weight breakdown for this course?")
+            results.append("What are the prerequisites required for this course?")
+            results.append("When are the assessments and major assignments scheduled?")
         else:
-            topic = class_name or "this course"
-            results.append(f"What are the most common practical applications of this topic in {topic}?")
-            results.append("What common pitfalls should be kept in mind regarding this concept?")
+            results.append(f"What common pitfalls and best practices should be kept in mind regarding {topic}?")
+            results.append(f"What are common real-world use cases where {topic} is applied?")
+            results.append(f"How can performance and safety be improved when working with {topic}?")
 
     unique: list[str] = []
     for q in results:
@@ -215,6 +258,7 @@ async def generate_followup_questions(
             SystemMessage(content=str(prompt["system-prompt"])),
             HumanMessage(content=str(prompt["user-prompt"])),
         ]
+        language_service.enforce_language(messages, language_service.detect_query_language(cleaned_q))
 
         timeout_sec = max(settings.chat_suggestions_timeout_seconds, 8.0)
         async with asyncio.timeout(timeout_sec):

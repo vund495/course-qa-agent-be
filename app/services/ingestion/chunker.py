@@ -157,6 +157,22 @@ def _split_into_sections(markdown: str) -> list[PageSection]:
     return sections
 
 
+def _is_ghost_or_toc_chunk(content: str) -> bool:
+    """Detect and discard table-of-contents dot-leader rows and bare headers without body."""
+    clean = content.strip()
+    if not clean:
+        return True
+    # Table of contents lines with dot leaders or Word bookmark errors
+    if re.search(r"\.{5,}|Bookmark not defined", clean, re.IGNORECASE):
+        return True
+    # Preserved code blocks
+    if "```" in clean or "~~~" in clean:
+        return False
+    # Drop chunks that are purely headers with no body text
+    body = re.sub(r"^#{1,6}\s+.*$", "", clean, flags=re.MULTILINE).strip()
+    return not body
+
+
 def _apply_locator(
     metadata: dict[str, Any],
     section: PageSection,
@@ -233,7 +249,7 @@ def markdown_chunker(
             _apply_locator(meta, section, ordered_keys, default_label)
 
             chunk.page_content = chunk.page_content.strip()
-            if chunk.page_content:
+            if chunk.page_content and not _is_ghost_or_toc_chunk(chunk.page_content):
                 output_chunks.append(chunk)
 
         if page_chunks:
@@ -361,6 +377,14 @@ def build_chunk_context(content: str, metadata: Mapping[str, Any]) -> str:
     """Add retrieval context without changing the source used for citations."""
     parts: list[str] = []
     section_path = metadata.get("section_path")
+    if not section_path:
+        headers = [
+            str(metadata.get(f"Header {i}"))
+            for i in range(1, 7)
+            if metadata.get(f"Header {i}")
+        ]
+        if headers:
+            section_path = " > ".join(headers)
     if section_path:
         parts.append(f"Section: {section_path}")
     table_header = metadata.get("table_header")
