@@ -52,7 +52,12 @@ def _visible_ticket(db: Session, *, ticket_id: uuid.UUID, user: User) -> Ticket:
         ticket = ticket_service.get_student_ticket(db, ticket_id=ticket_id, student_id=user.id)
     elif role in ("TRAINER", "TEACHING_ASSISTANT"):
         try:
-            ticket = ticket_service.get_trainer_ticket(db, ticket_id=ticket_id, trainer_id=user.id)
+            ticket = ticket_service.get_trainer_ticket(
+                db,
+                ticket_id=ticket_id,
+                trainer_id=user.id,
+                class_wide=role == "TEACHING_ASSISTANT",
+            )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
     else:
@@ -105,6 +110,7 @@ def list_tickets(
             status=status,
             page=page,
             page_size=page_size,
+            class_wide=role == "TEACHING_ASSISTANT",
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -142,7 +148,12 @@ def get_ticket_counts(
     if role_name_of(user) not in ("TRAINER", "TEACHING_ASSISTANT"):
         raise HTTPException(status_code=403, detail="Only trainers can view ticket counts.")
     try:
-        items = ticket_service.ticket_counts_for_trainer(db, trainer_id=user.id, class_id=class_id)
+        items = ticket_service.ticket_counts_for_trainer(
+            db,
+            trainer_id=user.id,
+            class_id=class_id,
+            class_wide=role_name_of(user) == "TEACHING_ASSISTANT",
+        )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return TicketCountsResponse(
@@ -199,7 +210,12 @@ def get_ticket(
         ticket = ticket_service.get_admin_ticket(db, ticket_id)
     elif role in ("TRAINER", "TEACHING_ASSISTANT"):
         try:
-            ticket = ticket_service.get_trainer_ticket(db, ticket_id=ticket_id, trainer_id=user.id)
+            ticket = ticket_service.get_trainer_ticket(
+                db,
+                ticket_id=ticket_id,
+                trainer_id=user.id,
+                class_wide=role == "TEACHING_ASSISTANT",
+            )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
     else:
@@ -231,13 +247,21 @@ def resolve_ticket(
     if role in ("TRAINER", "TEACHING_ASSISTANT"):
         try:
             existing = ticket_service.get_trainer_ticket(
-                db, ticket_id=ticket_id, trainer_id=user.id
+                db,
+                ticket_id=ticket_id,
+                trainer_id=user.id,
+                class_wide=role == "TEACHING_ASSISTANT",
             )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         if existing is None:
             raise HTTPException(status_code=404, detail="Ticket not found.")
-        ticket = ticket_service.resolve_trainer_ticket(db, ticket_id=ticket_id, trainer_id=user.id)
+        ticket = ticket_service.resolve_trainer_ticket(
+            db,
+            ticket_id=ticket_id,
+            trainer_id=user.id,
+            class_wide=role == "TEACHING_ASSISTANT",
+        )
         if ticket is None:
             raise HTTPException(
                 status_code=409, detail="Only an open or answered ticket can be resolved."
@@ -269,7 +293,10 @@ def reopen_ticket(
     elif role in ("TRAINER", "TEACHING_ASSISTANT"):
         try:
             existing = ticket_service.get_trainer_ticket(
-                db, ticket_id=ticket_id, trainer_id=user.id
+                db,
+                ticket_id=ticket_id,
+                trainer_id=user.id,
+                class_wide=role == "TEACHING_ASSISTANT",
             )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -411,6 +438,7 @@ def add_ticket_reply(
                 ticket_id=ticket_id,
                 trainer_id=user.id,
                 message=payload.message,
+                class_wide=role == "TEACHING_ASSISTANT",
             )
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc

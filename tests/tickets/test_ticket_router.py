@@ -559,7 +559,11 @@ def test_trainer_can_answer_consecutively_before_the_student_confirms(client, db
     ]
     # Each reply carries its real author, so the thread never assumes the
     # ticket owner wrote every staff message.
-    assert [reply["author_name"] for reply in thread["replies"]] == ["Trainer", "Trainer", "Trainer"]
+    assert [reply["author_name"] for reply in thread["replies"]] == [
+        "Trainer",
+        "Trainer",
+        "Trainer",
+    ]
 
 
 def test_follow_up_on_an_old_answered_ticket_restarts_expiration(client, db_session):
@@ -964,6 +968,7 @@ def inbox(db_session):
             student_id=db_session.info["student_id"],
             question=f"Question {index}",
             status=state,
+            owner_trainer_id=db_session.info["trainer_id"],
             created_at=datetime.now(UTC) - timedelta(hours=2) + timedelta(minutes=min(index, 3)),
         )
         db_session.add(ticket)
@@ -973,6 +978,7 @@ def inbox(db_session):
         student_id=db_session.info["other_student_id"],
         question="Private question",
         status="OPEN",
+        owner_trainer_id=outsider.id,
     )
     db_session.add(private_ticket)
     db_session.commit()
@@ -1102,18 +1108,88 @@ def test_foreign_class_filter_is_rejected_before_counting(client, db_session, in
     )
 
 
-def test_co_trainer_inbox_and_empty_assignment(client, db_session, inbox):
-    data = client.get("/api/tickets", headers=_headers(inbox["co_trainer"].id, "trainer")).json()
-    assert data["total"] == 4
-    assert all(item["class_id"] == str(db_session.info["class_id"]) for item in data["items"])
+def test_co_trainer_inbox_is_empty_until_a_ticket_is_handed_over(client, db_session, inbox):
+    # Ownership, not class membership, decides the inbox: a co-trainer sees
+    # nothing until a colleague hands a ticket over to them.
+    co_trainer = _headers(inbox["co_trainer"].id, "trainer")
+    data = client.get("/api/tickets", headers=co_trainer).json()
+    assert data["total"] == 0
+    assert data["items"] == []
     db_session.query(ClassTrainer).delete()
     db_session.commit()
+    assert client.get("/api/tickets", headers=co_trainer).json()["items"] == []
+
+
+def test_co_trainer_cannot_read_or_answer_another_trainers_ticket(client, db_session, inbox):
+    co_trainer = _headers(inbox["co_trainer"].id, "trainer")
+    target = next(ticket for ticket in inbox["items"] if ticket.status == "OPEN")
+
+    assert client.get(f"/api/tickets/{target.id}", headers=co_trainer).status_code == 403
     assert (
-        client.get("/api/tickets", headers=_headers(inbox["co_trainer"].id, "trainer")).json()[
-            "items"
-        ]
-        == []
+        client.post(
+            f"/api/tickets/{target.id}/replies", headers=co_trainer, json={"message": "Answer"}
+        ).status_code
+        == 403
     )
+    assert client.post(f"/api/tickets/{target.id}/resolve", headers=co_trainer).status_code == 403
+    target.status = "RESOLVED"
+    db_session.commit()
+    assert client.post(f"/api/tickets/{target.id}/reopen", headers=co_trainer).status_code == 403
+
+
+def test_ticket_visibility_follows_an_ownership_change(client, db_session, inbox):
+    primary = _headers(db_session.info["trainer_id"], "trainer")
+    co_trainer = _headers(inbox["co_trainer"].id, "trainer")
+    target = next(ticket for ticket in inbox["items"] if ticket.status == "OPEN")
+
+    def inbox_ids(headers) -> set[str]:
+        body = client.get("/api/tickets?page_size=100", headers=headers).json()
+        return {item["id"] for item in body["items"]}
+
+    assert str(target.id) in inbox_ids(primary)
+    assert str(target.id) not in inbox_ids(co_trainer)
+
+    target.owner_trainer_id = inbox["co_trainer"].id
+    db_session.commit()
+
+    assert str(target.id) not in inbox_ids(primary)
+    assert str(target.id) in inbox_ids(co_trainer)
+    assert client.get(f"/api/tickets/{target.id}", headers=co_trainer).status_code == 200
+    assert client.get(f"/api/tickets/{target.id}", headers=primary).status_code == 403
+
+
+def test_counts_only_include_owned_tickets(client, db_session, inbox):
+    primary = _headers(db_session.info["trainer_id"], "trainer")
+    co_trainer = _headers(inbox["co_trainer"].id, "trainer")
+    target = next(ticket for ticket in inbox["items"] if ticket.status == "OPEN")
+
+    assert client.get("/api/tickets/counts", headers=primary).json()["open_total"] == 4
+    target.owner_trainer_id = inbox["co_trainer"].id
+    db_session.commit()
+
+    assert client.get("/api/tickets/counts", headers=primary).json()["open_total"] == 3
+    mine = client.get("/api/tickets/counts", headers=co_trainer).json()
+    assert mine["open_total"] == 1
+    assert [item["class_id"] for item in mine["items"]] == [str(db_session.info["class_id"])]
+
+
+def test_legacy_ticket_without_owner_stays_with_the_class_primary(client, db_session, inbox):
+    primary = _headers(db_session.info["trainer_id"], "trainer")
+    co_trainer = _headers(inbox["co_trainer"].id, "trainer")
+    legacy = Ticket(
+        class_id=db_session.info["class_id"],
+        student_id=db_session.info["student_id"],
+        question="Legacy question",
+        status="OPEN",
+    )
+    db_session.add(legacy)
+    db_session.commit()
+
+    listed = client.get("/api/tickets?page_size=100", headers=primary).json()["items"]
+    assert str(legacy.id) in {item["id"] for item in listed}
+    others = client.get("/api/tickets?page_size=100", headers=co_trainer).json()["items"]
+    assert str(legacy.id) not in {item["id"] for item in others}
+    assert client.get(f"/api/tickets/{legacy.id}", headers=co_trainer).status_code == 403
 
 
 def test_ticket_counts_are_tracked_per_assigned_class(client, db_session, inbox):
@@ -1769,3 +1845,55 @@ def test_reply_without_text_or_attachments_is_rejected(client, db_session) -> No
         json={"message": "   "},
     )
     assert reply.status_code == 422
+
+
+def _add_teaching_assistant(db_session, class_id: uuid.UUID) -> User:
+    role = db_session.query(Role).filter(Role.name == "TEACHING_ASSISTANT").first()
+    if role is None:
+        role = Role(name="TEACHING_ASSISTANT")
+        db_session.add(role)
+        db_session.flush()
+    assistant = User(
+        full_name="Assistant",
+        email="ticket-assistant@example.com",
+        role_id=role.id,
+        status="ACTIVE",
+    )
+    db_session.add(assistant)
+    db_session.flush()
+    db_session.add(Enrollment(class_id=class_id, student_id=assistant.id, status="ACTIVE"))
+    db_session.commit()
+    return assistant
+
+
+def test_teaching_assistant_works_on_the_classes_tickets(client, db_session, inbox):
+    assistant = _add_teaching_assistant(db_session, db_session.info["class_id"])
+    headers = _headers(assistant.id, "teaching_assistant")
+    class_id = db_session.info["class_id"]
+    target = next(
+        ticket
+        for ticket in inbox["items"]
+        if ticket.class_id == class_id and ticket.status == "OPEN"
+    )
+
+    listed = client.get("/api/tickets?page_size=100", headers=headers)
+    assert listed.status_code == 200
+    assert str(target.id) in {item["id"] for item in listed.json()["items"]}
+
+    # Counts cover the class the assistant supports, not another trainer's class.
+    counts = client.get("/api/tickets/counts", headers=headers).json()
+    assert counts["open_total"] == 3
+    assert [item["class_id"] for item in counts["items"]] == [str(class_id)]
+
+    assert client.get(f"/api/tickets/{target.id}", headers=headers).status_code == 200
+    reply = client.post(
+        f"/api/tickets/{target.id}/replies", headers=headers, json={"message": "TA answer"}
+    )
+    assert reply.status_code == 201
+    assert reply.json()["author_name"] == "Assistant"
+
+    foreign = next(
+        ticket for ticket in inbox["items"] if ticket.class_id == db_session.info["other_class_id"]
+    )
+    assert client.get(f"/api/tickets/{foreign.id}", headers=headers).status_code == 403
+    assert client.post(f"/api/tickets/{foreign.id}/resolve", headers=headers).status_code == 403

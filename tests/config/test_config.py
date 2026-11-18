@@ -6,6 +6,12 @@ from pydantic import ValidationError
 from app.config import Settings
 
 
+def test_chat_context_defaults_to_twenty_exchanges():
+    settings = Settings(_env_file=None)
+
+    assert settings.chat_context_exchanges == 20
+
+
 def test_settings_loads_gemini_api_key_as_a_secret(monkeypatch):
     """Load a member's Gemini key as a masked secret value."""
     monkeypatch.setenv("GEMINI_API_KEY", "test-secret-key")
