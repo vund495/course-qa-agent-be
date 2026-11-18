@@ -533,12 +533,18 @@ def test_list_trainer_tickets_sweeps_when_trainer_is_off(db_session):
     items, total = ticket_service.list_trainer_tickets(db_session, trainer_id=primary.id)
 
     db_session.refresh(ticket)
-    assert total == 1
-    assert len(items) == 1
+    # The sweep moves the ticket to the co-trainer, so it leaves the inbox of
+    # the trainer who is off instead of staying visible to both.
+    assert total == 0
+    assert items == []
     assert ticket.owner_trainer_id == co.id
     handover = db_session.query(TicketHandover).one()
     assert handover.ticket_id == ticket.id
     assert handover.to_trainer_id == co.id
+
+    co_items, co_total = ticket_service.list_trainer_tickets(db_session, trainer_id=co.id)
+    assert co_total == 1
+    assert [item.id for item in co_items] == [ticket.id]
 
 
 def test_sweep_chooses_least_open_candidate(db_session):

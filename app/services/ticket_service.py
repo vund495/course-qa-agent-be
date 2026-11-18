@@ -4,7 +4,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import exists, func, or_, update
+from sqlalchemy import and_, exists, func, or_, update
 from sqlalchemy.orm import Session
 
 from app.models.course import Class, ClassTrainer, Enrollment
@@ -25,6 +25,18 @@ TICKET_ESCALATION_SLA_KEY = "ticket_escalation_sla_hours"
 DEFAULT_TICKET_ESCALATION_SLA_HOURS = 24
 MAX_TICKET_ESCALATION_SLA_HOURS = int(TICKET_EXPIRATION.total_seconds() // 3600) - 1
 RESOLVABLE_STATUSES = ("OPEN", "ANSWERED")
+
+
+def _owned_by_trainer(trainer_id: uuid.UUID):
+    """Only the trainer a ticket was sent to sees it in their inbox (AI-83).
+
+    Tickets created before the owner column existed fall back to the primary
+    trainer of their class, which is who the student sent them to.
+    """
+    return or_(
+        Ticket.owner_trainer_id == trainer_id,
+        and_(Ticket.owner_trainer_id.is_(None), Class.trainer_id == trainer_id),
+    )
 
 
 def expire_open_tickets(db: Session, *, now: datetime | None = None) -> int:
@@ -236,12 +248,11 @@ def add_trainer_reply(
     trainer_id: uuid.UUID,
     message: str,
 ) -> TicketReply | None:
-    expire_open_tickets(db)
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    # get_trainer_ticket enforces class access and ownership, so a colleague
+    # cannot answer a ticket that belongs to another trainer.
+    ticket = get_trainer_ticket(db, ticket_id=ticket_id, trainer_id=trainer_id)
     if ticket is None or ticket.status != "OPEN":
         return None
-    if ticket.class_id not in class_ids_for_trainer(db, trainer_id, active_only=True):
-        raise PermissionError("You are not assigned to this class.")
     if escalate_stale_tickets(db, class_ids={ticket.class_id}):
         db.refresh(ticket)
 
@@ -256,13 +267,20 @@ def add_trainer_reply(
 def get_trainer_ticket(
     db: Session, *, ticket_id: uuid.UUID, trainer_id: uuid.UUID
 ) -> Ticket | None:
-    """Return a ticket only when it belongs to one of the trainer's classes."""
+    """Return a ticket only to the trainer it was sent to.
+
+    Class access is still required (archived classes stay closed), and another
+    trainer's ticket is rejected instead of being silently shared.
+    """
     expire_open_tickets(db)
     ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
     if ticket is None:
         return None
-    if ticket.class_id not in class_ids_for_trainer(db, trainer_id, active_only=True):
+    clazz = db.query(Class).filter(Class.id == ticket.class_id).first()
+    if clazz is None or clazz.id not in class_ids_for_trainer(db, trainer_id, active_only=True):
         raise PermissionError("You are not assigned to this class.")
+    if (ticket.owner_trainer_id or clazz.trainer_id) != trainer_id:
+        raise PermissionError("This ticket belongs to another trainer.")
     return ticket
 
 
@@ -341,7 +359,8 @@ def ticket_counts_for_trainer(
     active_ids = [clazz.id for clazz in classes]
     rows = (
         db.query(Ticket.class_id, Ticket.status, func.count(Ticket.id))
-        .filter(Ticket.class_id.in_(active_ids))
+        .join(Class, Ticket.class_id == Class.id)
+        .filter(Ticket.class_id.in_(active_ids), _owned_by_trainer(trainer_id))
         .group_by(Ticket.class_id, Ticket.status)
         .all()
     )
@@ -424,7 +443,7 @@ def list_trainer_tickets(
         db.query(Ticket, User.full_name, Class.name, Class.code, Class.status)
         .join(User, Ticket.student_id == User.id)
         .join(Class, Ticket.class_id == Class.id)
-        .filter(Ticket.class_id.in_(scope))
+        .filter(Ticket.class_id.in_(scope), _owned_by_trainer(trainer_id))
     )
     if status is not None:
         query = query.filter(Ticket.status == status)
