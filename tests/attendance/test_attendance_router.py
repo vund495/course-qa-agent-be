@@ -911,14 +911,15 @@ def test_student_schedule_endpoint(client: TestClient, db_session: Session):
     assert sessions[0]["attendance_note"] == "Attended lecture"
     assert sessions[1]["attendance_status"] is None
 
-    assert data["holidays"] == [
-        {
-            "date": str(holiday_date),
-            "name": "Test holiday",
-            "type": "admin",
-            "scope": "system",
-        }
-    ]
+    # The window also carries the recurring Vietnamese holidays the service
+    # seeds (20/11 falls inside it today), so only require the admin holiday to
+    # be present instead of pinning the whole list.
+    assert {
+        "date": str(holiday_date),
+        "name": "Test holiday",
+        "type": "admin",
+        "scope": "system",
+    } in data["holidays"]
 
     # Only enrolled students can use the student schedule endpoint.
     assert (
