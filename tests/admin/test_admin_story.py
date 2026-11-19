@@ -204,15 +204,17 @@ def test_import_template_report_and_queue(client):
     assert any(r["status"] == "skipped" for r in detail["rows"])
 
     # AC-09: imports queue (not send inline); the admin drains the queue at
-    # the limited rate. Dry-run marks everything sent without real SMTP.
+    # the limited rate. A dry run records `dry_run`, never `sent` (AI-138 AC-01).
     stats = client.get("/api/admin/email-queue/stats", headers=h).json()
     assert stats["pending"] >= 1
     drained = client.post("/api/admin/email-queue/process", headers=h).json()
     assert drained["sent"] >= 1
     stats = client.get("/api/admin/email-queue/stats", headers=h).json()
     assert stats["pending"] == 0
+    assert stats["sent"] == 0
+    assert stats["dry_run"] >= 1
     # Failed emails can be re-queued without re-importing (AC-10).
-    queued = client.get("/api/admin/email-queue?status=sent", headers=h).json()
+    queued = client.get("/api/admin/email-queue?status=dry_run", headers=h).json()
     assert len(queued) >= 1
 
     # AC-07: admin never sees generated passwords — neither in the batch

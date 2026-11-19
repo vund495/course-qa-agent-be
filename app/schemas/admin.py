@@ -270,6 +270,8 @@ class EmailQueueStats(BaseModel):
     pending: int
     sent: int
     failed: int
+    # Simulated sends, counted apart from `sent` (AI-138 AC-01).
+    dry_run: int = 0
     # Live drain progress (AC-09): the admin UI shows "running" + progress and
     # disables "Process queue now" until `draining` goes back to false.
     draining: bool = False
@@ -289,6 +291,8 @@ class EmailOutboxRead(BaseModel):
     last_error: str
     created_at: datetime
     sent_at: datetime | None = None
+    last_attempt_at: datetime | None = None
+    failed_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 

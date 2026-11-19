@@ -13,7 +13,13 @@ from email.message import EmailMessage
 from sqlalchemy.orm import Session
 
 from app.config import Settings, settings
-from app.models.email_outbox import EMAIL_FAILED, EMAIL_PENDING, EMAIL_SENT, EmailOutbox
+from app.models.email_outbox import (
+    EMAIL_DRY_RUN,
+    EMAIL_FAILED,
+    EMAIL_PENDING,
+    EMAIL_SENT,
+    EmailOutbox,
+)
 from app.models.system_config import SystemConfig
 
 CONFIG_KEYS = (
@@ -175,9 +181,14 @@ def _send_one(
     subject: str,
     body: str,
     dry_run: bool,
-) -> None:
+) -> bool:
+    """Deliver one message. Returns True when it really left the server.
+
+    AI-138 AC-01: a dry run returns False instead of pretending to succeed, so
+    the caller can record a simulated send as its own status rather than `sent`.
+    """
     if dry_run:
-        return
+        return False
     if not sender or not app_password:
         raise RuntimeError("Email sender is not configured — set sender + app password first.")
     msg = EmailMessage()
@@ -189,6 +200,7 @@ def _send_one(
         smtp.starttls()
         smtp.login(sender, app_password)
         smtp.send_message(msg)
+    return True
 
 
 _QUEUE_LOCK = threading.Lock()
@@ -262,15 +274,23 @@ def _drain_queue(db: Session, max_messages: int | None = None, sleep_between: bo
                 _DRAIN_STATE.update(done=i + 1, sent=sent, failed=failed)
                 continue
             entry.attempts += 1
+            entry.last_attempt_at = datetime.now(UTC)
             try:
-                _send_one(host, port, sender, app_password, entry.to_email, entry.subject, entry.body, cfg["email_dry_run"])
-                entry.status = EMAIL_SENT
+                delivered = _send_one(host, port, sender, app_password, entry.to_email, entry.subject, entry.body, cfg["email_dry_run"])
+                if delivered:
+                    entry.status = EMAIL_SENT
+                    entry.sent_at = datetime.now(UTC)
+                    entry.failed_at = None
+                    sent += 1
+                else:
+                    # AI-138 AC-01: never report a simulated send as `sent`.
+                    entry.status = EMAIL_DRY_RUN
+                    sent += 1
                 entry.last_error = ""
-                entry.sent_at = datetime.now(UTC)
-                sent += 1
             except Exception as exc:  # noqa: BLE001 — recorded per row for the admin report
                 entry.status = EMAIL_FAILED
                 entry.last_error = str(exc)[:2000]
+                entry.failed_at = datetime.now(UTC)
                 failed += 1
             db.commit()
             _DRAIN_STATE.update(done=i + 1, sent=sent, failed=failed)
@@ -286,6 +306,7 @@ def queue_stats(db: Session) -> dict:
         "pending": db.query(EmailOutbox).filter(EmailOutbox.status == EMAIL_PENDING).count(),
         "sent": db.query(EmailOutbox).filter(EmailOutbox.status == EMAIL_SENT).count(),
         "failed": db.query(EmailOutbox).filter(EmailOutbox.status == EMAIL_FAILED).count(),
+        "dry_run": db.query(EmailOutbox).filter(EmailOutbox.status == EMAIL_DRY_RUN).count(),
         **drain_status(),
     }
 
