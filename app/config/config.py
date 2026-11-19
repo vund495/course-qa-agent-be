@@ -84,7 +84,11 @@ class Settings(BaseSettings):
         default="assistant-documents-agent", validation_alias="COLLECTION_NAME"
     )
     vector_size: ClassVar[int] = 1536
-    retrieval_threshold: ClassVar[float] = 0.8
+    # AI-161: measured on the fixed eval set (eval/retrieval). The Cross Encoder
+    # score the router thresholds on sits lower than raw cosine; 0.80 refused
+    # 60% of answerable questions, 0.45 holds it at 26.7% with 100% off-topic
+    # rejection. See docs/design/ai-161-retrieval-parameter-tuning.md.
+    retrieval_threshold: ClassVar[float] = 0.45
     content_gap_similarity_threshold: ClassVar[float] = 0.85
     content_gap_search_count: ClassVar[int] = 3
     content_gap_student_percentage: ClassVar[float] = 0.10
