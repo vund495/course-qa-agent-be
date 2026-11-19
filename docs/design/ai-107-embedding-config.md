@@ -11,10 +11,12 @@ database-backed configuration are outside this task's current scope.
 > **AI-65 update:** `retrieval_threshold` is now the exception. AI-65 (AC-05 /
 > T35) stores the active value in `system_config` and exposes it through
 > `GET/PATCH /api/admin/retrieval-config`, so an admin can change it without a
-> redeploy. `settings.retrieval_threshold = 0.8` remains the documented default
-> used when no valid DB value exists. See
-> `docs/design/ai-65-retrieval-score-threshold.md`. The other values below stay
-> fixed in code.
+> redeploy. `settings.retrieval_threshold` is the documented default used when no
+> valid DB value exists. See `docs/design/ai-65-retrieval-score-threshold.md`.
+> The other values below stay fixed in code.
+>
+> **AI-161 update:** the default is now `0.45`, measured on the fixed eval set
+> (`eval/retrieval`). See `docs/design/ai-161-retrieval-parameter-tuning.md`.
 
 The Jira default of two students for a content gap is outdated. The team's current
 decision is to require at least 10% of active students in the class.
@@ -25,7 +27,7 @@ decision is to require at least 10% of active students in the class.
 |---|---:|---|
 | `embedding_model` | `gemini-embedding-2` | Model identifier for generating document/query vectors. Future ingestion and RAG services must use this value. |
 | `vector_size` | `1536` | Required vector dimension for embeddings stored in Qdrant. It must match the embedding output and collection configuration. |
-| `retrieval_threshold` | `0.8` | Minimum knowledge-base similarity score for selecting a KB answer instead of Internet fallback. The future RAG flow must read this setting. |
+| `retrieval_threshold` | `0.45` (AI-161) | Minimum knowledge-base score for selecting a KB answer instead of Internet fallback. Measured on `eval/retrieval`; see `docs/design/ai-161-retrieval-parameter-tuning.md`. |
 | `content_gap_similarity_threshold` | `0.85` | Similarity threshold for grouping similar questions into a content-gap topic. |
 | `content_gap_search_count` | `3` | Minimum Internet searches for a topic in the configured period. |
 | `content_gap_student_percentage` | `0.10` (10%) | Minimum share of active students in a class asking about the topic. The eventual count is `ceil(active_students × 0.10)`. |

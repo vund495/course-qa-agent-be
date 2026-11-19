@@ -1,0 +1,174 @@
+{
+  "description": "AI-161 fixed retrieval evaluation set. Questions are written the way students actually ask them (English and Vietnamese) against the six Python course slide decks in eval/retrieval/corpus. 'expected_documents' lists every corpus file that legitimately contains the answer; a hit means any of them appears in the top-k.",
+  "corpus": "eval/retrieval/corpus",
+  "questions": [
+    {
+      "id": "q01",
+      "question": "What are the important characteristics of a Python list?",
+      "expected_documents": ["collection-data-types.md"]
+    },
+    {
+      "id": "q02",
+      "question": "How do I access the last element of a list?",
+      "expected_documents": ["collection-data-types.md"]
+    },
+    {
+      "id": "q03",
+      "question": "What does the append method do on a list?",
+      "expected_documents": ["collection-data-types.md"]
+    },
+    {
+      "id": "q04",
+      "question": "Why does a set automatically remove duplicates?",
+      "expected_documents": ["collection-data-types.md"]
+    },
+    {
+      "id": "q05",
+      "question": "How fast is element lookup in a set compared to a list?",
+      "expected_documents": ["collection-data-types.md"]
+    },
+    {
+      "id": "q06",
+      "question": "What is the difference between a list and a set?",
+      "expected_documents": ["collection-data-types.md"]
+    },
+    {
+      "id": "q07",
+      "question": "Can a tuple be used as a key in a dictionary?",
+      "expected_documents": ["collection-data-types.md", "tuple-dictionary.md"]
+    },
+    {
+      "id": "q08",
+      "question": "How do I declare a tuple that contains a single value?",
+      "expected_documents": ["tuple-dictionary.md", "collection-data-types.md"]
+    },
+    {
+      "id": "q09",
+      "question": "What happens when I read a value for a key that does not exist in a dictionary?",
+      "expected_documents": ["tuple-dictionary.md", "collection-data-types.md"]
+    },
+    {
+      "id": "q10",
+      "question": "How do I use setdefault to initialize a dictionary value?",
+      "expected_documents": ["collection-data-types.md"]
+    },
+    {
+      "id": "q11",
+      "question": "What is collections.defaultdict used for?",
+      "expected_documents": ["collection-data-types.md"]
+    },
+    {
+      "id": "q12",
+      "question": "Làm sao để xóa một phần tử khỏi dictionary?",
+      "expected_documents": ["tuple-dictionary.md", "collection-data-types.md"]
+    },
+    {
+      "id": "q13",
+      "question": "How does Python use indentation to define blocks of code?",
+      "expected_documents": ["python-introduction.md"]
+    },
+    {
+      "id": "q14",
+      "question": "What are the rules for naming identifiers in Python?",
+      "expected_documents": ["python-introduction.md"]
+    },
+    {
+      "id": "q15",
+      "question": "What is the difference between the break and continue statements?",
+      "expected_documents": ["python-introduction.md"]
+    },
+    {
+      "id": "q16",
+      "question": "How do I write a while loop in Python?",
+      "expected_documents": ["python-introduction.md"]
+    },
+    {
+      "id": "q17",
+      "question": "What are the membership operators in Python?",
+      "expected_documents": ["python-introduction.md"]
+    },
+    {
+      "id": "q18",
+      "question": "How do I convert a string to an integer?",
+      "expected_documents": ["python-introduction.md"]
+    },
+    {
+      "id": "q19",
+      "question": "Cú pháp của câu lệnh if elif else trong Python là gì?",
+      "expected_documents": ["python-introduction.md"]
+    },
+    {
+      "id": "q20",
+      "question": "Which escape character represents a newline inside a string?",
+      "expected_documents": ["python-introduction.md"]
+    },
+    {
+      "id": "q21",
+      "question": "How do I define a function that has default arguments?",
+      "expected_documents": ["modular-programming.md"]
+    },
+    {
+      "id": "q22",
+      "question": "What is a lambda function?",
+      "expected_documents": ["modular-programming.md"]
+    },
+    {
+      "id": "q23",
+      "question": "What are the access modes for opening a file in Python?",
+      "expected_documents": ["modular-programming.md"]
+    },
+    {
+      "id": "q24",
+      "question": "How do I rename a file using the os module?",
+      "expected_documents": ["modular-programming.md"]
+    },
+    {
+      "id": "q25",
+      "question": "What is the finally block used for in exception handling?",
+      "expected_documents": ["modular-programming.md"]
+    },
+    {
+      "id": "q26",
+      "question": "Làm thế nào để import một module trong Python?",
+      "expected_documents": ["modular-programming.md"]
+    },
+    {
+      "id": "q27",
+      "question": "How do I check whether a string starts with a given prefix?",
+      "expected_documents": ["string-regex.md"]
+    },
+    {
+      "id": "q28",
+      "question": "How do I use re.findall to extract email addresses from text?",
+      "expected_documents": ["string-regex.md"]
+    },
+    {
+      "id": "q29",
+      "question": "What does the re.sub function do?",
+      "expected_documents": ["string-regex.md"]
+    },
+    {
+      "id": "q30",
+      "question": "Các flag re.I và re.M trong module re có ý nghĩa gì?",
+      "expected_documents": ["string-regex.md"]
+    }
+  ],
+  "out_of_scope": [
+    {
+      "id": "x01",
+      "question": "What is the capital of France?"
+    },
+    {
+      "id": "x02",
+      "question": "How do I deploy a Django application to AWS Lambda?"
+    },
+    {
+      "id": "x03",
+      "question": "What is the time complexity of Dijkstra's algorithm?"
+    },
+    {
+      "id": "x04",
+      "question": "Giá vàng hôm nay là bao nhiêu?"
+    }
+  ]
+}

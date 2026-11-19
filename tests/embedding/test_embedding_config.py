@@ -8,7 +8,8 @@ def test_settings_use_confirmed_embedding_defaults():
 
     assert settings.embedding_model == "gemini-embedding-2"
     assert settings.vector_size == 1536
-    assert settings.retrieval_threshold == 0.8
+    # AI-161: tuned on the fixed eval set, not guessed.
+    assert settings.retrieval_threshold == 0.45
     assert settings.content_gap_similarity_threshold == 0.85
     assert settings.content_gap_search_count == 3
     assert settings.content_gap_student_percentage == 0.10
