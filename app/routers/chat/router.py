@@ -9,7 +9,7 @@ from datetime import date
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from sqlalchemy.orm import Session
 
@@ -18,14 +18,22 @@ from app.models.course import Class, ClassTrainer, Enrollment
 from app.models.document import Document
 from app.models.ticket import Ticket
 from app.models.user import User
-from app.schemas.chat import ChatQuotaResponse, ChatRequest
+from app.schemas.chat import (
+    ChatQuotaResponse,
+    ChatRequest,
+    WebConsentDecisionRequest,
+    WebConsentPendingResponse,
+    WebConsentResult,
+)
 from app.schemas.tickets import TicketRead
 from app.services import (
     chat_context_service,
-    chat_service,
     document_service,
     pdf_highlight_service,
     quota_service,
+    strict_chat_service,
+    strict_web_service,
+    web_consent_service,
 )
 from app.services.course_service import STATUS_ARCHIVED
 
@@ -260,6 +268,64 @@ def get_chat_quota(
     )
 
 
+@router.get("/consent/pending", response_model=WebConsentPendingResponse)
+def get_pending_consent(
+    class_id: uuid.UUID,
+    session_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> WebConsentPendingResponse:
+    """Return the unexpired consent offer for this exact owned conversation."""
+
+    _require_class_access(db=db, user=current_user, class_id=class_id)
+    offer = web_consent_service.get_pending_offer(
+        db,
+        user_id=current_user.id,
+        class_id=class_id,
+        session_id=session_id,
+    )
+    return WebConsentPendingResponse(
+        offer=web_consent_service.offer_read(offer) if offer is not None else None
+    )
+
+
+@router.post("/consent/{offer_id}", response_model=None)
+async def decide_web_consent(
+    offer_id: uuid.UUID,
+    payload: WebConsentDecisionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Decline one offer, or stream the accepted web answer as SSE."""
+
+    _require_class_access(db=db, user=current_user, class_id=payload.class_id)
+    try:
+        outcome = await strict_chat_service.decide_consent(
+            db=db,
+            user_id=current_user.id,
+            offer_id=offer_id,
+            class_id=payload.class_id,
+            session_id=payload.session_id,
+            decision=payload.decision,
+        )
+    except strict_web_service.WebEvidenceError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Web search did not produce enough validated evidence.",
+        ) from exc
+
+    if isinstance(outcome, WebConsentResult):
+        return JSONResponse(content=outcome.model_dump(mode="json"))
+    return StreamingResponse(
+        outcome,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("")
 async def chat(
     payload: ChatRequest,
@@ -286,7 +352,7 @@ async def chat(
             detail=quota_service.limit_reached_message(quota),
         )
 
-    stream = chat_service.stream_chat(
+    stream = strict_chat_service.stream_chat(
         db=db,
         message=payload.message,
         class_id=payload.class_id,

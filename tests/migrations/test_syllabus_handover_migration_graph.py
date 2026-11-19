@@ -12,7 +12,10 @@ LEGACY_SYLLABUS_REVISION = "0046_syllabus_draft_units"
 UPSTREAM_ABSENCE_REVISION = "0046_absence_handover"
 SYLLABUS_MERGE_REVISION = "0047_merge_syllabus_handover"
 ADMIN_LEAVE_REVISION = "0047_admin_leave"
-FINAL_MERGE_REVISION = "0048_merge_syllabus_admin_leave"
+SYLLABUS_ADMIN_MERGE_REVISION = "0048_merge_syllabus_admin_leave"
+CHAT_WEB_CONSENT_REVISION = "0049_chat_web_consent"
+TICKET_ATTACHMENT_NAMES_REVISION = "0050_ticket_attachment_names"
+HEAD_REVISION = "0051_merge_consent_attachments"
 
 BASELINE_DDL = (
     'CREATE TABLE "user" (id CHAR(32) PRIMARY KEY)',
@@ -90,7 +93,7 @@ def test_upgrade_from_legacy_syllabus_revision_preserves_data(tmp_path):
     engine = sa.create_engine(url)
     with engine.connect() as conn:
         version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == FINAL_MERGE_REVISION
+        assert version == HEAD_REVISION
 
         unit = conn.execute(
             sa.text("SELECT unit_title, content FROM syllabus_draft_unit WHERE id = :id"),
@@ -130,14 +133,14 @@ def test_fresh_branch_point_upgrade_reaches_single_merge_head(tmp_path):
     command.upgrade(cfg, "head")
 
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_heads() == [FINAL_MERGE_REVISION]
+    assert script.get_heads() == [HEAD_REVISION]
 
     engine = sa.create_engine(url)
     tables = set(sa.inspect(engine).get_table_names())
     assert {"syllabus_draft_unit", "leave_request", "trainer_day_status"} <= tables
     with engine.connect() as conn:
         version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-    assert version == FINAL_MERGE_REVISION
+    assert version == HEAD_REVISION
     engine.dispose()
 
 
@@ -156,7 +159,7 @@ def test_upgrade_from_upstream_absence_head_adds_syllabus_schema(tmp_path):
     engine = sa.create_engine(url)
     with engine.connect() as conn:
         version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == FINAL_MERGE_REVISION
+        assert version == HEAD_REVISION
         document_columns = {
             column["name"] for column in sa.inspect(conn).get_columns("document")
         }
@@ -176,8 +179,13 @@ def test_graph_is_a_single_merge_head():
     cfg = Config("alembic.ini")
     script = ScriptDirectory.from_config(cfg)
 
-    assert script.get_heads() == [FINAL_MERGE_REVISION]
-    merge = script.get_revision(FINAL_MERGE_REVISION)
+    assert script.get_heads() == [HEAD_REVISION]
+    head = script.get_revision(HEAD_REVISION)
+    assert set(head.down_revision) == {
+        CHAT_WEB_CONSENT_REVISION,
+        TICKET_ATTACHMENT_NAMES_REVISION,
+    }
+    merge = script.get_revision(SYLLABUS_ADMIN_MERGE_REVISION)
     assert set(merge.down_revision) == {
         SYLLABUS_MERGE_REVISION,
         ADMIN_LEAVE_REVISION,

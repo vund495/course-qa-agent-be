@@ -199,6 +199,7 @@ def test_cited_page_citations_merges_same_page_chunks():
     assert sources[0].page == 33
     assert sources[0].pages == (33,)
     assert sources[0].page_label == "33"
+    assert sources[0].section == "C++"
     assert set(sources[0].indexes) == {1, 2}
     # Highlights from both chunks are preserved
     assert len(sources[0].highlights) == 2
@@ -226,7 +227,167 @@ def test_cited_page_citations_merges_adjacent_page_section():
     assert sources[0].page == 40
     assert sources[0].pages == (40, 41)
     assert sources[0].page_label == "40-41"
+    assert sources[0].section == "C++ > Pointers"
     assert set(sources[0].indexes) == {1, 2}
+
+
+def test_citation_section_falls_back_to_headers_then_page_only():
+    from app.services.rag_service import ScoredChunk, cited_page_citations, curriculum_citations
+
+    header_chunk = ScoredChunk(
+        content="Pointers store memory addresses.",
+        score=0.9,
+        metadata={
+            "document_id": "doc-headers",
+            "page_number": 7,
+            "Header 1": "Chapter 1",
+            "Header 2": "Section 1.1",
+        },
+    )
+    header_sources = cited_page_citations(
+        [header_chunk], "Pointers store memory addresses [1]."
+    )
+    assert header_sources[0].section == "Chapter 1 > Section 1.1"
+
+    section_chunk = ScoredChunk(
+        content="Pointers can be dereferenced.",
+        score=0.9,
+        metadata={
+            "document_id": "doc-section",
+            "page_number": 9,
+            "section_path": "C++ > Pointers",
+        },
+    )
+    provisional = curriculum_citations([section_chunk])
+    assert provisional[0].section == "C++ > Pointers"
+
+    page_only_chunk = ScoredChunk(
+        content="Pointers can be compared.",
+        score=0.9,
+        metadata={"document_id": "doc-page-only", "page_number": 11},
+    )
+    page_only = cited_page_citations(
+        [page_only_chunk], "Pointers can be compared [1]."
+    )
+    assert page_only[0].section is None
+    assert page_only[0].page == 11
+
+    unrelated_sections = ScoredChunk(
+        content="Alpha fact is true.",
+        score=0.9,
+        metadata={
+            "document_id": "doc-mixed",
+            "page_number": 12,
+            "section_path": "Intro",
+        },
+    )
+    unrelated_sections_2 = ScoredChunk(
+        content="Beta fact is true.",
+        score=0.9,
+        metadata={
+            "document_id": "doc-mixed",
+            "page_number": 12,
+            "section_path": "Code",
+        },
+    )
+    merged = cited_page_citations(
+        [unrelated_sections, unrelated_sections_2],
+        "Alpha fact is true [1]. Beta fact is true [2].",
+    )
+    assert len(merged) == 1
+    assert merged[0].section is None
+
+
+def test_citation_cleans_legacy_ocr_section_path_but_preserves_valid_suffix():
+    from app.services.rag_service import ScoredChunk, curriculum_citations
+
+    corrupted_prefix = (
+        "4: Right subtree<br>23<br> and left subtree<br>#3: Left subtree<br>"
+        "14 31<br> no right subtree<br>#2: Right subtree 7<br> no left subtree<br>"
+        "#1: Leaf Node 9<br><!-- End of picture text -->"
+    )
+    queue_chunk = ScoredChunk(
+        content="Queue enqueue and dequeue steps.",
+        score=0.9,
+        metadata={
+            "document_id": "dsa-doc",
+            "page_number": 59,
+            "section_path": f"{corrupted_prefix} > Queues",
+        },
+    )
+    nested_chunk = ScoredChunk(
+        content="A standard queue supports enqueue and dequeue.",
+        score=0.9,
+        metadata={
+            "document_id": "dsa-doc",
+            "page_number": 60,
+            "section_path": f"{corrupted_prefix} > Queues > 6.1 A standard queue",
+        },
+    )
+
+    queue_source, nested_source = curriculum_citations([queue_chunk, nested_chunk])
+    assert queue_source.section == "Queues"
+    assert nested_source.section == "Queues > 6.1 A standard queue"
+
+
+def test_citation_preserves_valid_ocr_and_generic_section_titles():
+    from app.services.rag_service import ScoredChunk, curriculum_citations
+
+    chunk = ScoredChunk(
+        content="OCR overview and a generic stack implementation.",
+        score=0.9,
+        metadata={
+            "document_id": "ocr-doc",
+            "page_number": 7,
+            "section_path": "OCR Overview > Stack <T>",
+        },
+    )
+
+    source = curriculum_citations([chunk])[0]
+    assert source.section == "OCR Overview > Stack <T>"
+
+
+def test_citation_preserves_plain_picture_text_and_lowercase_generic_title():
+    from app.services.rag_service import ScoredChunk, curriculum_citations
+
+    chunk = ScoredChunk(
+        content="Picture text section for a generic stack.",
+        score=0.9,
+        metadata={
+            "document_id": "picture-doc",
+            "page_number": 8,
+            "section_path": "Picture Text > Stack <p>",
+        },
+    )
+
+    source = curriculum_citations([chunk])[0]
+    assert source.section == "Picture Text > Stack <p>"
+
+
+def test_history_citation_schema_preserves_section_and_page_metadata():
+    from app.schemas.history import ChatCitation
+
+    citation = ChatCitation.model_validate(
+        {
+            "index": 1,
+            "kind": "curriculum",
+            "title": "C++ slides.pdf",
+            "url": None,
+            "snippet": "Pointers store addresses.",
+            "document_id": "doc-1",
+            "page": 7,
+            "pages": [7, 8],
+            "page_label": "7-8",
+            "section": "Chapter 1 > Pointers",
+            "indexes": [1],
+            "highlights": ["Pointers store addresses."],
+        }
+    )
+
+    assert citation.section == "Chapter 1 > Pointers"
+    assert citation.pages == [7, 8]
+    assert citation.page_label == "7-8"
+    assert citation.model_dump()["section"] == "Chapter 1 > Pointers"
 
 
 def test_code_block_citation_prefers_code_over_intro_sentence():

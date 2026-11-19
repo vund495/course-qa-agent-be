@@ -177,7 +177,7 @@ def test_chat_streams_sse_for_an_enrolled_student(
             },
         )
 
-    monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(chat_router.strict_chat_service, "stream_chat", fake_stream_chat)
 
     class_id = db_session.info["class_a_id"]
     response = client.post(
@@ -258,7 +258,7 @@ def test_chat_loads_context_for_an_owned_session(
             {"source": "none", "used_web_search": False, "threshold": 0.8, "top_score": None},
         )
 
-    monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(chat_router.strict_chat_service, "stream_chat", fake_stream_chat)
 
     response = client.post(
         "/api/chat",
@@ -296,7 +296,7 @@ def test_chat_rejects_another_users_session(
         raise AssertionError("The stream must not start for another user's session.")
         yield  # pragma: no cover
 
-    monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(chat_router.strict_chat_service, "stream_chat", fake_stream_chat)
 
     response = client.post(
         "/api/chat",
@@ -384,7 +384,7 @@ def test_chat_rejects_an_archived_class_for_an_enrolled_student(
             },
         )
 
-    monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(chat_router.strict_chat_service, "stream_chat", fake_stream_chat)
 
     response = client.post(
         "/api/chat",
@@ -416,7 +416,7 @@ def test_chat_rejects_an_archived_class_for_its_trainer(
             },
         )
 
-    monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(chat_router.strict_chat_service, "stream_chat", fake_stream_chat)
 
     response = client.post(
         "/api/chat",
@@ -461,7 +461,7 @@ def test_admin_can_still_chat_in_an_archived_class(
             },
         )
 
-    monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(chat_router.strict_chat_service, "stream_chat", fake_stream_chat)
     token = create_access_token(str(admin.id), "admin")
 
     response = client.post(
@@ -515,6 +515,249 @@ def test_student_cannot_open_a_source_from_an_archived_class(
     assert response.json()["detail"] == "Class not found."
 
 
+def _create_consent_offer(db_session: Session, session, *, expired: bool = False):
+    from app.models.chat import ChatWebConsent
+
+    offer = ChatWebConsent(
+        user_id=db_session.info["student_id"],
+        class_id=db_session.info["class_a_id"],
+        session_id=session.id,
+        scope_kind="missing",
+        question="What does photosynthesis do and who discovered it?",
+        query_text="who discovered it?",
+        scope_segments=["who discovered it?"],
+        status="pending",
+        expires_at=datetime.now(UTC) + (timedelta(minutes=-1) if expired else timedelta(minutes=30)),
+    )
+    db_session.add(offer)
+    db_session.commit()
+    db_session.refresh(offer)
+    return offer
+
+
+def _consent_session(db_session: Session, *, user_id=None):
+    from app.models.chat import ChatSession
+
+    session = ChatSession(
+        user_id=user_id or db_session.info["student_id"],
+        class_id=db_session.info["class_a_id"],
+        title="Consent test",
+    )
+    db_session.add(session)
+    db_session.commit()
+    db_session.refresh(session)
+    return session
+
+
+def test_pending_consent_survives_history_and_decline_removes_it(
+    client: TestClient,
+    student_headers: dict[str, str],
+    db_session: Session,
+) -> None:
+    session = _consent_session(db_session)
+    offer = _create_consent_offer(db_session, session)
+
+    pending = client.get(
+        "/api/chat/consent/pending",
+        params={"class_id": str(db_session.info["class_a_id"]), "session_id": str(session.id)},
+        headers=student_headers,
+    )
+    assert pending.status_code == 200
+    assert pending.json()["offer"]["id"] == str(offer.id)
+
+    detail = client.get(f"/api/history/{session.id}", headers=student_headers)
+    assert detail.status_code == 200
+    assert detail.json()["pending_consent"]["query_scope"] == ["who discovered it?"]
+
+    declined = client.post(
+        f"/api/chat/consent/{offer.id}",
+        headers=student_headers,
+        json={
+            "decision": "decline",
+            "class_id": str(db_session.info["class_a_id"]),
+            "session_id": str(session.id),
+        },
+    )
+    assert declined.status_code == 200
+    assert declined.json()["status"] == "declined"
+    pending_after = client.get(
+        "/api/chat/consent/pending",
+        params={"class_id": str(db_session.info["class_a_id"]), "session_id": str(session.id)},
+        headers=student_headers,
+    )
+    assert pending_after.json()["offer"] is None
+
+
+def test_consent_accepts_only_the_owned_pending_offer(
+    client: TestClient,
+    student_headers: dict[str, str],
+    db_session: Session,
+    monkeypatch,
+) -> None:
+    session = _consent_session(db_session)
+    offer = _create_consent_offer(db_session, session)
+    calls: list[dict] = []
+
+    async def fake_decide(**kwargs):
+        calls.append(kwargs)
+        from app.schemas.chat import WebConsentResult
+
+        return WebConsentResult(
+            offer_id=kwargs["offer_id"],
+            status="accepted",
+            answer="**Web Search Answer**\n\nvalidated",
+            citations=[],
+            assistant_message_id=None,
+        )
+
+    monkeypatch.setattr(chat_router.strict_chat_service, "decide_consent", fake_decide)
+    accepted = client.post(
+        f"/api/chat/consent/{offer.id}",
+        headers=student_headers,
+        json={
+            "decision": "accept",
+            "class_id": str(db_session.info["class_a_id"]),
+            "session_id": str(session.id),
+        },
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "accepted"
+    assert calls[0]["offer_id"] == offer.id
+
+    monkeypatch.undo()
+    forged = client.post(
+        f"/api/chat/consent/{uuid.uuid4()}",
+        headers=student_headers,
+        json={
+            "decision": "accept",
+            "class_id": str(db_session.info["class_a_id"]),
+            "session_id": str(session.id),
+        },
+    )
+    assert forged.status_code == 404
+
+
+def test_consent_without_web_results_streams_error_and_keeps_offer_pending(
+    client: TestClient,
+    student_headers: dict[str, str],
+    db_session: Session,
+    monkeypatch,
+) -> None:
+    session = _consent_session(db_session)
+    offer = _create_consent_offer(db_session, session)
+    monkeypatch.setattr(
+        chat_router.strict_chat_service.rag_service,
+        "search_internet",
+        lambda _query: [],
+    )
+
+    response = client.post(
+        f"/api/chat/consent/{offer.id}",
+        headers=student_headers,
+        json={
+            "decision": "accept",
+            "class_id": str(db_session.info["class_a_id"]),
+            "session_id": str(session.id),
+        },
+    )
+
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    assert "event: progress" in response.text
+    assert "event: error" in response.text
+    db_session.refresh(offer)
+    assert offer.status == "pending"
+    assert offer.web_message_id is None
+
+
+def test_consent_accept_streams_tokens_and_persists_the_web_answer(
+    client: TestClient,
+    student_headers: dict[str, str],
+    db_session: Session,
+    monkeypatch,
+) -> None:
+    from app.models.chat import ChatMessage
+
+    session = _consent_session(db_session)
+    offer = _create_consent_offer(db_session, session)
+    monkeypatch.setattr(
+        chat_router.strict_chat_service.rag_service,
+        "search_internet",
+        lambda _query: [
+            chat_router.strict_chat_service.rag_service.WebResult(
+                title="Public reference",
+                url="https://example.com/reference",
+                content="A web snippet",
+            )
+        ],
+    )
+
+    async def fake_stream(_db, _messages, **_kwargs):
+        yield "Streamed web "
+        yield "answer [1]."
+
+    monkeypatch.setattr(chat_router.strict_chat_service.gateway, "astream_chat", fake_stream)
+
+    response = client.post(
+        f"/api/chat/consent/{offer.id}",
+        headers=student_headers,
+        json={
+            "decision": "accept",
+            "class_id": str(db_session.info["class_a_id"]),
+            "session_id": str(session.id),
+        },
+    )
+
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    assert response.text.count("event: token") == 2
+    assert "event: citation" in response.text
+    assert "event: done" in response.text
+
+    messages = (
+        db_session.query(ChatMessage)
+        .filter(ChatMessage.session_id == session.id)
+        .all()
+    )
+    assert len(messages) == 1
+    assert messages[0].content == "Streamed web answer [1]."
+    assert messages[0].used_web_search is True
+    db_session.refresh(offer)
+    assert offer.status == "consumed"
+    assert offer.web_message_id == messages[0].id
+
+
+def test_expired_or_cross_user_offer_is_rejected(
+    client: TestClient,
+    student_headers: dict[str, str],
+    db_session: Session,
+) -> None:
+    session = _consent_session(db_session)
+    expired = _create_consent_offer(db_session, session, expired=True)
+    got = client.post(
+        f"/api/chat/consent/{expired.id}",
+        headers=student_headers,
+        json={
+            "decision": "accept",
+            "class_id": str(db_session.info["class_a_id"]),
+            "session_id": str(session.id),
+        },
+    )
+    assert got.status_code == 409
+
+    fresh = _create_consent_offer(db_session, session)
+    cross_user = client.post(
+        f"/api/chat/consent/{fresh.id}",
+        headers=_trainer_headers(db_session),
+        json={
+            "decision": "accept",
+            "class_id": str(db_session.info["class_a_id"]),
+            "session_id": str(session.id),
+        },
+    )
+    assert cross_user.status_code == 404
+
+
 def test_chat_quota_reports_and_enforces_the_daily_limit(
     client: TestClient,
     student_headers: dict[str, str],
@@ -559,7 +802,7 @@ def test_failed_answer_refunds_the_question(
     async def fake_stream_chat(**_kwargs):
         yield _event("error", {"message": "boom"})
 
-    monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(chat_router.strict_chat_service, "stream_chat", fake_stream_chat)
     student = db_session.get(User, db_session.info["student_id"])
     assert student is not None
     before = quota_service.get_status(db_session, student)
@@ -588,7 +831,7 @@ def test_stream_token_containing_done_still_refunds_on_error(
         yield _event("token", {"text": "event: done"})
         yield _event("error", {"message": "boom"})
 
-    monkeypatch.setattr(chat_router.chat_service, "stream_chat", fake_stream_chat)
+    monkeypatch.setattr(chat_router.strict_chat_service, "stream_chat", fake_stream_chat)
     student = db_session.get(User, db_session.info["student_id"])
     assert student is not None
     before = quota_service.get_status(db_session, student)

@@ -135,3 +135,55 @@ class ChatMessage(Base):
     def can_create_feedback_ticket(self) -> bool:
         """Require an assistant answer with an identifiable original question."""
         return self.role == "ASSISTANT" and self.original_question is not None
+
+
+class ChatWebConsent(Base):
+    """One immutable, user-bound web-search consent offer.
+
+    The query scope is stored when the offer is created and is never supplied by
+    the client on accept. A consumed offer can only return its existing web
+    answer; it cannot trigger another search.
+    """
+
+    __tablename__ = "chat_web_consent"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'processing', 'consumed', 'declined', 'expired')",
+            name="ck_chat_web_consent_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    class_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("class.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("chat_session.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    assistant_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("chat_message.id", ondelete="SET NULL"), nullable=True
+    )
+    web_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("chat_message.id", ondelete="SET NULL"), nullable=True
+    )
+    scope_kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    query_text: Mapped[str] = mapped_column(Text, nullable=False)
+    scope_segments: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    conflict_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    conflict_citations: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", server_default="pending", index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    declined_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
