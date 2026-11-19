@@ -197,7 +197,9 @@ def _answer_cue_warnings(index: int, options: Any) -> list[str]:
     longest_wrong = max(wrong)
     if longest_correct > longest_wrong + ANSWER_CUE_TOLERANCE:
         return [
-            f"item {index}: correct option is {longest_correct} chars but the "
-            f"longest distractor is {longest_wrong} chars, which gives the answer away"
+            (
+                f"item {index}: correct option is {longest_correct} chars but the "
+                f"longest distractor is {longest_wrong} chars, which gives the answer away"
+            )
         ]
     return []
