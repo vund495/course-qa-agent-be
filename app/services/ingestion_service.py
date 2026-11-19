@@ -7,9 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.core.database import get_session_local
-from app.models.course import Class
-from app.services import document_service, document_validation_service
-from app.services.document_validation_service import DocumentRelevanceError
+from app.services import document_service
 from app.services.embedding.gemini_embedding import GeminiEmbedding
 from app.services.ingestion.chunker import build_chunk_context, markdown_chunker, recursive_chunker
 from app.services.ingestion.cleaner import clean_marker_markdown
@@ -33,8 +31,6 @@ def _failure_reason(error: Exception) -> str:
         return "Gemini embedding rate limit was hit repeatedly. Wait a minute, then retry the document."
     if isinstance(error, FileNotFoundError):
         return "The stored source file could not be found. Upload the document again."
-    if isinstance(error, DocumentRelevanceError):
-        return f"Course relevance: {error}"
     if isinstance(error, SyllabusFormatError):
         return "Syllabus format is not recognized or contains no course units."
     if isinstance(error, ValueError):
@@ -75,25 +71,6 @@ def process_document(db: Session, document_id: uuid.UUID | str, force: bool = Fa
             raise ValueError("No readable text found in document.")
 
         file_name = getattr(record, "file_name", "") or path.name
-
-        # Validate course relevance before vector indexing
-        clazz = db.get(Class, record.class_id)
-        if (
-            clazz
-            and isinstance(getattr(clazz, "name", None), str)
-            and not force
-        ):
-            class_desc = clazz.info.description if getattr(clazz, "info", None) else None
-            is_relevant, rejection_reason = document_validation_service.validate_document_relevance(
-                db,
-                class_name=clazz.name,
-                class_code=clazz.code,
-                class_description=class_desc,
-                file_name=file_name,
-                document_text=markdown,
-            )
-            if not is_relevant:
-                raise DocumentRelevanceError(rejection_reason or "Document does not match course subject.")
 
         roadmap = (
             parse_syllabus_markdown(markdown)
