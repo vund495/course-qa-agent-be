@@ -305,3 +305,56 @@ def test_scope_timeout_fails_open_without_query_generation(monkeypatch):
     monkeypatch.setattr(decision_service.gateway, "ainvoke_chat", unexpected_query_call)
     assert asyncio.run(_class_decision()) is None
     assert len(captured["calls"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("answers", "error", "expected"),
+    [
+        (
+            {
+                "chunk_1": _answer("noul", noul=0.10),
+                "chunk_2": _answer("noul", noul=0.11),
+                "chunk_3": _answer("noul", noul=0.98),
+            },
+            None,
+            (0, 2, 3),
+        ),
+        ({"chunk_1": _answer("noul", noul=0.01)}, None, (0, 1, 2, 3)),
+        (None, TimeoutError(), (0, 1, 2, 3)),
+    ],
+)
+def test_rerank_gate_checks_top_three_in_one_request_and_fails_open(
+    monkeypatch, answers, error, expected
+):
+    from app.services.rag_service import ScoredChunk
+
+    monkeypatch.setenv("RERANK_DECISION_ENABLED", "true")
+    monkeypatch.setattr(decision_service, "settings", type(decision_service.settings)(_env_file=None))
+    captured = _use_gemini(monkeypatch, response=SimpleNamespace(answers=answers), error=error)
+    chunks = tuple(
+        ScoredChunk(content=f"Content {i}", score=score, metadata={})
+        for i, score in enumerate((0.2, 0.9, 0.8, 0.7))
+    )
+
+    result = asyncio.run(decision_service.filter_reranked_chunks(question="Question?", chunks=chunks))
+
+    assert result == tuple(chunks[i] for i in expected)
+    (call,) = captured["calls"]
+    assert call["model"] == "gemini-decision-1"
+    assert set(call["questions"]) == {"chunk_1", "chunk_2", "chunk_3"}
+    assert all(value["type"] == "noul" for value in call["questions"].values())
+    assert "Content 0" not in call["input"]
+
+
+def test_rerank_gate_is_disabled_by_default(monkeypatch):
+    from app.services.rag_service import ScoredChunk
+
+    monkeypatch.delenv("RERANK_DECISION_ENABLED", raising=False)
+    monkeypatch.setattr(decision_service, "settings", type(decision_service.settings)(_env_file=None))
+    captured = _use_gemini(monkeypatch)
+    chunks = (ScoredChunk(content="Evidence", score=0.9, metadata={}),)
+
+    assert asyncio.run(
+        decision_service.filter_reranked_chunks(question="Question?", chunks=chunks)
+    ) == chunks
+    assert captured["calls"] == []

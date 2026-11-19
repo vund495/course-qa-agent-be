@@ -35,7 +35,7 @@ class Settings(BaseSettings):
         vlm_temperature: Temperature setting for VLM responses.
         google_api_key: Secret API key for Google Gemini model access.
         decision_provider: Provider used for the class scope verdict (gemini).
-        decision_model: Decisions API model for class scope.
+        decision_model: Decisions API model for class scope and optional rerank gating.
         scope_query_model: Generative model used to create English retrieval and web queries.
         decision_key_attempts: How many admin-managed keys one decision attempt may try.
         decision_confidence_threshold: Minimum confidence before a scope verdict blocks a turn.
@@ -149,6 +149,16 @@ class Settings(BaseSettings):
         ge=1,
         le=10,
         validation_alias="DECISION_KEY_ATTEMPTS",
+    )
+    rerank_decision_enabled: bool = Field(default=False, validation_alias="RERANK_DECISION_ENABLED")
+    rerank_decision_top_k: int = Field(
+        default=3, ge=1, le=10, validation_alias="RERANK_DECISION_TOP_K"
+    )
+    rerank_decision_reject_threshold: float = Field(
+        default=0.10, ge=0.0, le=0.5, validation_alias="RERANK_DECISION_REJECT_THRESHOLD"
+    )
+    rerank_decision_timeout_seconds: float = Field(
+        default=2.0, gt=0.0, le=10.0, validation_alias="RERANK_DECISION_TIMEOUT_SECONDS"
     )
     serpapi_api_key: str | None = Field(default=None, validation_alias="SERPAPI_API_KEY")
     serpapi_timeout_seconds: float = Field(

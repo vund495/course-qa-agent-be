@@ -630,3 +630,32 @@ def test_consent_releases_offer_when_search_has_no_usable_results(
 
 async def _collect(stream) -> list[str]:
     return [item async for item in stream]
+
+
+def test_course_lane_gates_reranked_chunks_before_source_validation(monkeypatch):
+    original = _chunk()
+    chunks = (original, rag_service.ScoredChunk(content="Other", score=0.7, metadata={}))
+    user_id, session_id = _patch_common(monkeypatch, result=_result("full"), chunks=chunks)
+    calls = []
+
+    async def filter_chunks(*, question, chunks, db):
+        calls.append((question, chunks))
+        return (original,)
+
+    async def validate(*, question, sources, **_kwargs):
+        assert [source.content for source in sources] == [original.content]
+        return _result("full")
+
+    monkeypatch.setattr(decision_service, "filter_reranked_chunks", filter_chunks, raising=False)
+    monkeypatch.setattr(strict_sources_service, "generate_strict_sources_answer", validate)
+
+    raw = asyncio.run(_collect(strict_chat_service.stream_chat(
+        db=object(),
+        message="What does photosynthesis do?",
+        class_id=uuid.uuid4(),
+        user_id=user_id,
+        session_id=session_id,
+    )))
+
+    assert calls == [("What does photosynthesis do?", chunks)]
+    assert _events(raw)[-1][0] == "done"

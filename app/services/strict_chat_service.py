@@ -296,6 +296,14 @@ async def stream_chat(
             trace.append(
                 f"Retrieved {len(chunks)} class sections (score={decision.top_score})"
             )
+            filtered = await decision_service.filter_reranked_chunks(
+                question=standalone,
+                chunks=chunks,
+                db=db,
+            )
+            if len(filtered) != len(chunks):
+                trace.append(f"Decision rerank gate kept {len(filtered)} of {len(chunks)} course sections")
+            chunks = filtered
             yield _sse(
                 "progress",
                 {
