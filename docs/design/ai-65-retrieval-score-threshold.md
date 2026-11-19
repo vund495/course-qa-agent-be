@@ -18,7 +18,7 @@ An administrator can inspect and adjust both thresholds ($T_{high}$ and $T_{low}
 
 | Decision | Rationale |
 |---|---|
-| 3-Tier Routing Decision in `app/services/rag_service.py` | Formulates the decision boundary based on dual thresholds: $T_{high}$ (`retrieval_threshold`, default `0.80`) and $T_{low}$ (`unrelated_threshold`, default `0.45`). |
+| 3-Tier Routing Decision in `app/services/rag_service.py` | Formulates the decision boundary based on dual thresholds: $T_{high}$ (`retrieval_threshold`, default `0.45` since AI-161) and $T_{low}$ (`unrelated_threshold`, default `0.45`). AI-161 measured the default on a fixed eval set; see `docs/design/ai-161-retrieval-parameter-tuning.md`. |
 | Fail-Fast CPU Bypass in `app/services/chat_retrieval_service.py` | If the maximum cosine candidate returned by Qdrant is already below $T_{low}$, Cross-Encoder reranking is skipped completely, cutting off-topic query latency from 5–6s to < 0.2s. |
 | Preserving Cosine Similarity in `app/services/reranker_service.py` | Cross-Encoder reorders chunk candidates for optimal contextual generation, but the original normalized cosine similarity score $[0.0, 1.0]$ is preserved on `chunk.score` for consistent threshold evaluation. |
 | Dual Threshold Persistence in `system_configs` | Both `retrieval_threshold` and `unrelated_threshold` are persisted in the database, overriding defaults dynamically on the next student question without server restarts. |
@@ -27,7 +27,7 @@ An administrator can inspect and adjust both thresholds ($T_{high}$ and $T_{low}
 ## Threshold Decision Boundary
 
 ```
-      Score >= T_high (0.80)     -->  SOURCE_CURRICULUM (Answer from Class Slides/Docs)
+      Score >= T_high (0.45)     -->  SOURCE_CURRICULUM (Answer from Class Slides/Docs)
 T_low <= Score <  T_high (0.45)  -->  SOURCE_INTERNET   (Search Google/Internet Agent)
          Score <  T_low (0.45)   -->  SOURCE_UNRELATED  (Out of Scope Refusal, No Search)
 ```
@@ -40,8 +40,8 @@ Retrieves the currently active upper and lower thresholds.
 
 ```json
 {
-  "threshold": 0.8,
-  "default_threshold": 0.8,
+  "threshold": 0.45,
+  "default_threshold": 0.45,
   "unrelated_threshold": 0.45,
   "default_unrelated_threshold": 0.45,
   "is_default": true,

@@ -11,6 +11,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from app.config.config import get_settings
+from app.services.section_path import clean_section_path, is_corrupted_section_segment
 
 __all__ = ["build_chunk_context", "markdown_chunker", "recursive_chunker"]
 
@@ -45,7 +46,9 @@ def _get_deepest_header(metadata: dict[str, Any], ordered_keys: list[str]) -> st
 
 def _build_section_path(metadata: dict[str, Any], ordered_keys: list[str]) -> str:
     """Build a hierarchical breadcrumb string from the shallowest to the deepest header."""
-    return " > ".join(metadata[k] for k in ordered_keys if metadata.get(k))
+    return clean_section_path(
+        " > ".join(metadata[k] for k in ordered_keys if metadata.get(k))
+    )
 
 
 def _inherit_headers(
@@ -62,7 +65,9 @@ def _inherit_headers(
     for key in ordered_keys:
         if key in metadata:
             overridden = True
-        elif not overridden and key in inherited:
+        elif not overridden and key in inherited and not is_corrupted_section_segment(
+            inherited[key]
+        ):
             metadata[key] = inherited[key]
 
 

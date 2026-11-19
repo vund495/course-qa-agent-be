@@ -134,6 +134,33 @@ def test_markdown_chunker_table_preserves_headers():
     assert sum(c.page_content.count("| Col1 | Col2 | Col3 |") for c in sub_chunks) == 1
 
 
+def test_markdown_chunker_preserves_valid_ocr_and_generic_headings():
+    markdown = "# OCR Overview\n## Stack <T>\nbody"
+    chunks = markdown_chunker(markdown, metadata={"file_name": "Dsa.pdf"})
+
+    assert chunks[0].metadata.get("section_path") == "OCR Overview > Stack <T>"
+
+
+def test_markdown_chunker_preserves_plain_picture_text_and_lowercase_generic_headings():
+    markdown = "# Picture Text\n## Stack <p>\nbody"
+    chunks = markdown_chunker(markdown, metadata={"file_name": "Dsa.pdf"})
+
+    assert chunks[0].metadata.get("section_path") == "Picture Text > Stack <p>"
+
+
+def test_markdown_chunker_drops_corrupted_ocr_heading_from_section_path():
+    markdown = """# 4: Right subtree<br>23<br> and left subtree<br><!-- End of picture text -->
+old tree body
+<!-- page break -->
+## Queues
+queue body
+"""
+    chunks = markdown_chunker(markdown, metadata={"file_name": "Dsa.pdf"})
+
+    queue_chunk = next(c for c in chunks if "queue body" in c.page_content)
+    assert queue_chunk.metadata.get("section_path") == "Queues"
+
+
 def test_markdown_chunker_does_not_leak_later_headers_onto_earlier_chunks():
     markdown = """# A
 alpha body

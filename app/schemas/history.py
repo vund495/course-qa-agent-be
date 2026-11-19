@@ -21,6 +21,9 @@ class ChatCitation(BaseModel):
     snippet: str = ""
     document_id: str | None = None
     page: int | None = None
+    pages: list[int] = Field(default_factory=list)
+    page_label: str | None = None
+    section: str | None = None
     indexes: list[int] = Field(default_factory=list)
     highlights: list[str] = Field(default_factory=list)
 
@@ -145,10 +148,25 @@ class ChatSessionListResponse(BaseModel):
     total: int = 0
 
 
+class PendingWebConsent(BaseModel):
+    """Unexpired web-search offer restored with a conversation."""
+
+    id: uuid.UUID
+    session_id: uuid.UUID
+    scope_kind: Literal["missing", "full"]
+    question: str
+    query_scope: list[str] = Field(default_factory=list)
+    conflict_note: str | None = None
+    conflict_citations: list[ChatCitation] = Field(default_factory=list)
+    expires_at: datetime
+    assistant_message_id: uuid.UUID | None = None
+
+
 class ChatDetailResponse(ChatSessionResponse):
     """Detailed response schema for a session including all ordered messages (AC-05, AC-07)."""
 
     messages: list[ChatMessageResponse] = Field(default_factory=list)
+    pending_consent: PendingWebConsent | None = None
 
 
 class DeleteSessionResponse(BaseModel):

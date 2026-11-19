@@ -10,7 +10,7 @@ from app.models.attendance import (  # noqa: F401
     TrainerDayStatus,
 )
 from app.models.category import ClassCategory  # noqa: F401
-from app.models.chat import ChatMessage, ChatSession  # noqa: F401
+from app.models.chat import ChatMessage, ChatSession, ChatWebConsent  # noqa: F401
 from app.models.course import Class, ClassConfig, ClassTrainer, Course, Enrollment  # noqa: F401
 from app.models.document import Document, SyllabusUnit  # noqa: F401
 from app.models.email_outbox import EmailOutbox  # noqa: F401

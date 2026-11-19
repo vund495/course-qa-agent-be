@@ -145,6 +145,7 @@ class Source:
     page: int | None = None
     pages: tuple[int, ...] = ()
     page_label: str | None = None
+    section: str | None = None
     # Answer markers ([n]) this page backs, and the exact passages used.
     indexes: tuple[int, ...] = ()
     highlights: tuple[str, ...] = ()
@@ -745,6 +746,74 @@ GenerateAnswer = Callable[[str, str], str]
 InternetSearch = Callable[[str], Sequence[WebResult]]
 
 
+def prepare_web_answer(
+    question: str,
+    results: Sequence[WebResult],
+) -> tuple[list[Source], str, str]:
+    """Build web citations and the exact Internet prompt pair for snippets.
+
+    Callers that stream the answer still use the same prompt/context contract as
+    :func:`answer_web_results`; the model never receives course material.
+    """
+
+    cleaned = question.strip()
+    if not cleaned:
+        raise ValueError("Question must not be empty.")
+    if not results:
+        raise ValueError("At least one web result is required.")
+
+    sources = internet_citations(results)
+    context = "\n\n".join(
+        f"[{source.index}] {source.title} — {source.url}\n{result.content}"
+        for source, result in zip(sources, results, strict=True)
+    )
+    system_prompt, user_prompt = _format_prompt(
+        "answer-internet-prompt", context, cleaned
+    )
+    return sources, system_prompt, user_prompt
+
+
+def cited_web_citations(
+    sources: Sequence[Source],
+    answer: str,
+) -> list[Source]:
+    """Return only the web sources whose markers the complete answer uses."""
+
+    used = cited_markers(answer)
+    return [source for source in sources if source.index in used]
+
+
+def answer_web_results(
+    question: str,
+    results: Sequence[WebResult],
+    *,
+    generate: GenerateAnswer | None = None,
+    threshold: float = 0.0,
+    top_score: float | None = None,
+) -> QaAnswer:
+    """Answer from already-fetched SerpApi snippets using the Internet prompt.
+
+    This is the established web-only path: it never runs class retrieval and
+    never receives course chunks or conversation history.
+    """
+
+    sources, system_prompt, user_prompt = prepare_web_answer(question, results)
+    text = _generate_prompt(
+        generate,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+    answer = text or _source_only_answer(sources)
+    return QaAnswer(
+        answer=answer,
+        source=SOURCE_INTERNET,
+        used_web_search=True,
+        threshold=threshold,
+        top_score=top_score,
+        citations=tuple(cited_web_citations(sources, answer)),
+    )
+
+
 def answer_question(
     db: Session,
     *,
@@ -812,26 +881,12 @@ def answer_question(
     if not results:
         return _no_source_answer(decision)
 
-    sources = internet_citations(results)
-    context = "\n\n".join(
-        f"[{source.index}] {source.title} — {source.url}\n{result.content}"
-        for source, result in zip(sources, results, strict=True)
-    )
-    text = _generate(
-        generate,
-        prompt_name="answer-internet-prompt",
-        context=context,
-        question=cleaned,
-    )
-    answer = text or _source_only_answer(sources)
-    used = cited_markers(answer)
-    return QaAnswer(
-        answer=answer,
-        source=SOURCE_INTERNET,
-        used_web_search=True,
+    return answer_web_results(
+        cleaned,
+        results,
+        generate=generate,
         threshold=decision.threshold,
         top_score=decision.top_score,
-        citations=tuple(source for source in sources if source.index in used),
     )
 
 
@@ -844,6 +899,29 @@ def _format_page_label(pages: Sequence[int]) -> str | None:
     if sorted_pages == list(range(sorted_pages[0], sorted_pages[-1] + 1)):
         return f"{sorted_pages[0]}-{sorted_pages[-1]}"
     return ", ".join(str(p) for p in sorted_pages)
+
+
+def _common_section_path(chunks: Sequence[ScoredChunk]) -> str | None:
+    """Return the shared section prefix of merged chunks, or ``None``.
+
+    A merged citation may cover chunks from different but related sections.
+    Showing only the first chunk's section would mislabel the other passages;
+    the common prefix is still derived from the metadata and never invented.
+    """
+
+    paths = [
+        section
+        for chunk in chunks
+        if (section := citation_service._chunk_section_path(chunk.metadata))
+    ]
+    if not paths:
+        return None
+    common: list[str] = []
+    for parts in zip(*(path.split(" > ") for path in paths)):
+        if len(set(parts)) != 1:
+            break
+        common.append(parts[0])
+    return " > ".join(common) if common else None
 
 
 def curriculum_citations(chunks: Sequence[ScoredChunk]) -> list[Source]:
@@ -864,6 +942,7 @@ def curriculum_citations(chunks: Sequence[ScoredChunk]) -> list[Source]:
                 page=p,
                 pages=(p,) if p is not None else (),
                 page_label=str(p) if p is not None else None,
+                section=citation_service._chunk_section_path(chunk.metadata) or None,
                 highlights=highlights,
             )
         )
@@ -969,6 +1048,7 @@ def cited_page_citations(
                 page=first_page,
                 pages=tuple(all_pages),
                 page_label=page_label,
+                section=_common_section_path([chunk for _, chunk in members]),
                 indexes=tuple(index for index, _ in members),
                 highlights=highlights,
             )
@@ -1021,6 +1101,41 @@ def _source_only_answer(sources: Sequence[Source]) -> str:
     return "\n".join(lines)
 
 
+def _clean_generated_text(raw_text: str) -> str:
+    """Normalise headings and citation links from a model answer."""
+
+    cleaned_lines = []
+    for line in raw_text.splitlines():
+        heading_match = re.match(r"^#{1,6}\s+(.+)$", line)
+        if heading_match:
+            cleaned_lines.append(f"**{heading_match.group(1)}**")
+        else:
+            cleaned_lines.append(line)
+    cleaned_text = "\n".join(cleaned_lines)
+
+    # Strip inline URLs attached to citation markers: [1](http...) or [1] (http...) -> [1]
+    cleaned_text = re.sub(r"\[(\d+)\]\s*\([^)]+\)", r"[\1]", cleaned_text)
+    # Strip redundant outer parentheses around citations: ([1]) -> [1]
+    cleaned_text = re.sub(r"\(\s*(\[\d+\])\s*\)", r"\1", cleaned_text)
+    return cleaned_text
+
+
+def _generate_prompt(
+    generate: GenerateAnswer | None,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """Call a generator with an already formatted prompt pair."""
+
+    generator = generate or generate_with_gemini
+    try:
+        return _clean_generated_text(generator(system_prompt, user_prompt).strip())
+    except Exception:  # the request still returns cited sources
+        logger.exception("Answer generation failed; returning source-only answer.")
+        return ""
+
+
 def _generate(
     generate: GenerateAnswer | None,
     *,
@@ -1030,29 +1145,12 @@ def _generate(
 ) -> str:
     """Call the injected generator (or Gemini) and never let failures hide sources."""
 
-    generator = generate or generate_with_gemini
-    try:
-        system_prompt, user_prompt = _format_prompt(prompt_name, context, question)
-        raw_text = generator(system_prompt, user_prompt).strip()
-        # Clean heading hashes (#, ##, ###) into clean bold text
-        cleaned_lines = []
-        for line in raw_text.splitlines():
-            heading_match = re.match(r"^#{1,6}\s+(.+)$", line)
-            if heading_match:
-                cleaned_lines.append(f"**{heading_match.group(1)}**")
-            else:
-                cleaned_lines.append(line)
-        cleaned_text = "\n".join(cleaned_lines)
-
-        # Strip inline URLs attached to citation markers: [1](http...) or [1] (http...) -> [1]
-        cleaned_text = re.sub(r"\[(\d+)\]\s*\([^)]+\)", r"[\1]", cleaned_text)
-        # Strip redundant outer parentheses around citations: ([1]) -> [1]
-        cleaned_text = re.sub(r"\(\s*(\[\d+\])\s*\)", r"\1", cleaned_text)
-
-        return cleaned_text
-    except Exception:  # the request still returns cited sources
-        logger.exception("Answer generation failed; returning source-only answer.")
-        return ""
+    system_prompt, user_prompt = _format_prompt(prompt_name, context, question)
+    return _generate_prompt(
+        generate,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
 
 
 def _format_prompt(

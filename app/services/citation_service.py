@@ -9,6 +9,7 @@ from typing import Any
 
 from app.services.ingestion.chunker import _fenced_ranges
 from app.services.ingestion.cleaner import _PROTECTED, _protect, _restore, _strip_emphasis
+from app.services.section_path import section_path_from_metadata
 
 _MARKER_PATTERN = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 _LIST_ITEM_PATTERN = re.compile(
@@ -548,17 +549,8 @@ def verify_citations(
 
 
 def _chunk_section_path(meta: Any) -> str:
-    """Extract or reconstruct section hierarchy path from chunk metadata."""
-    if not isinstance(meta, dict):
-        return ""
-    if path := meta.get("section_path"):
-        return str(path)
-    headers = [
-        str(meta.get(f"Header {i}"))
-        for i in range(1, 7)
-        if meta.get(f"Header {i}")
-    ]
-    return " > ".join(headers)
+    """Extract, clean, or reconstruct the section hierarchy from chunk metadata."""
+    return section_path_from_metadata(meta)
 
 
 def extract_cited_passages(

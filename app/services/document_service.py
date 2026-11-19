@@ -650,6 +650,21 @@ def delete_document(db: Session, record: Document) -> int:
     return purged
 
 
+def class_has_uploaded_documents(db: Session, class_id: uuid.UUID | str) -> bool:
+    """True when the class has any uploaded document row.
+
+    Pending, processing, failed, rejected, replaced and indexed rows all count:
+    the empty-class message is only for a class with no upload records at all.
+    "No retrieval matches" is a different state handled by the strict path.
+    """
+
+    try:
+        class_uuid = uuid.UUID(str(class_id))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return db.query(Document.id).filter(Document.class_id == class_uuid).first() is not None
+
+
 def retrievable_document_ids(db: Session, class_id: uuid.UUID | str) -> set[str]:
     """Ids inside one class that may still answer questions (AI-39 AC-02).
 

@@ -2,6 +2,27 @@
 
 SSE streaming chat endpoint + agent orchestration. Prefix: `/api/chat`.
 
+**Strict-source flow (current):** `POST /api/chat` retrieves class-scoped
+documents first and validates intent evidence with `strict_sources_service`.
+A full result streams only validated course explanations: each supported intent
+carries a short 2-4 sentence explanation grounded in its cited source, with no
+outside or web facts. If one supported intent is followed by a completeness
+audit that finds multiple ordered segments, one bounded recovery call
+regenerates one intent per audit segment; failure still fails closed. Citations
+store a `section` locator derived from chunk
+`section_path`/`Header 1-6` and fall back to page only. A class with zero
+uploaded document rows receives the deterministic Vietnamese no-materials
+message before scope/retrieval/model/web/consent; pending or failed uploads
+still count as rows and continue through the normal no-evidence/consent path.
+Partial/none turns emit a
+`consent` SSE event with a user-bound offer. No web search occurs before
+`POST /api/chat/consent/{offer_id}` receives an explicit accept. The accepted
+web answer is persisted as a separate `used_web_search=true` assistant message
+and never receives course documents or prior doc answers. `GET
+/api/chat/consent/pending` and `pending_consent` on history detail restore the
+offer after reload. The legacy `docs_plus_web`/`web_search`/`code_help` paths
+are no longer wired to this endpoint.
+
 | Jira | Story | Assignee | Status |
 |---|---|---|---|
 | AI-59 | Student Chat Interface (FE part) | Nguyễn Chí Trung | To Do |
