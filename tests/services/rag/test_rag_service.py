@@ -161,13 +161,13 @@ def _answer_text(system_prompt: str, user_prompt: str) -> str:
 # --- AC-05: admin-configurable threshold -----------------------------------
 
 
-def test_threshold_defaults_to_documented_0_8(db_session):
-    """No stored row -> AI-107's documented default 0.8 (AC-01, AC-05)."""
+def test_threshold_defaults_to_measured_0_45(db_session):
+    """No stored row -> the AI-161 measured default 0.45 (AC-01, AC-05)."""
 
-    assert rag_service.get_retrieval_threshold(db_session) == 0.8
+    assert rag_service.get_retrieval_threshold(db_session) == 0.45
     config = rag_service.retrieval_threshold_config(db_session)
-    assert config["threshold"] == 0.8
-    assert config["default_threshold"] == 0.8
+    assert config["threshold"] == 0.45
+    assert config["default_threshold"] == 0.45
     assert config["is_default"] is True
 
 
@@ -196,7 +196,7 @@ def test_invalid_stored_threshold_falls_back_to_default(db_session):
     db_session.add(SystemConfig(key=rag_service.RETRIEVAL_THRESHOLD_KEY, value="not-a-number"))
     db_session.commit()
 
-    assert rag_service.get_retrieval_threshold(db_session) == 0.8
+    assert rag_service.get_retrieval_threshold(db_session) == 0.45
 
 
 @pytest.mark.parametrize("value", [-0.01, 1.01, float("nan"), float("inf")])
@@ -238,13 +238,13 @@ def test_score_equal_to_threshold_answers_from_curriculum(db_session):
     """AC-02: `>=` is inclusive at the boundary."""
 
     clazz, document = _seed_class_and_document(db_session)
-    store = FakeStore([_chunk(score=0.8, document_id=str(document.id))])
+    store = FakeStore([_chunk(score=0.45, document_id=str(document.id))])
 
     decision = rag_service.decide_source(
         db_session, question="Boundary?", class_id=clazz.id, store=store
     )
 
-    assert decision.threshold == 0.8
+    assert decision.threshold == 0.45
     assert decision.source == rag_service.SOURCE_CURRICULUM
 
 
@@ -287,6 +287,10 @@ def test_score_below_threshold_hands_question_to_internet_agent(db_session):
     """AC-03: low KB confidence -> T19 agent, never a refusal/ticket."""
 
     clazz, document = _seed_class_and_document(db_session)
+    # AI-161 lowered the shipped high threshold to 0.45, so 0.55 now routes to
+    # the curriculum. Pin the high threshold above the score to keep exercising
+    # the Internet band (0.45 <= score < high).
+    rag_service.save_retrieval_threshold(db_session, 0.80)
     store = FakeStore([_chunk(score=0.55, document_id=str(document.id))])
     agent = FakeInternetAgent(
         [
@@ -370,6 +374,9 @@ def test_threshold_change_switches_the_same_score_between_sources(db_session):
         [rag_service.WebResult("Web", "https://example.com", "Web content")]
     )
 
+    # AI-161: the measured default (0.45) would answer 0.75 from the curriculum,
+    # so start from the previous 0.80 default to show the switch both ways.
+    rag_service.save_retrieval_threshold(db_session, 0.80)
     low_confidence = rag_service.decide_source(
         db_session, question="Same score", class_id=clazz.id, store=store
     )
@@ -421,6 +428,9 @@ def test_internet_agent_outage_returns_no_source_message(db_session):
     """AC-03 + AC-04: no source at all -> a normal message, never an invented answer."""
 
     clazz, document = _seed_class_and_document(db_session)
+    # AI-161: 0.55 is curriculum at the measured 0.45 default; pin the high
+    # threshold so the score lands in the Internet band and the agent is tried.
+    rag_service.save_retrieval_threshold(db_session, 0.80)
     store = FakeStore([_chunk(score=0.55, document_id=str(document.id))])
 
     def generate(system_prompt: str, user_prompt: str) -> str:
@@ -559,8 +569,8 @@ def test_admin_reads_default_retrieval_threshold(client, admin_headers):
 
     assert response.status_code == 200, response.text
     assert response.json() == {
-        "threshold": 0.8,
-        "default_threshold": 0.8,
+        "threshold": 0.45,
+        "default_threshold": 0.45,
         "is_default": True,
         "updated_at": None,
         "unrelated_threshold": 0.45,

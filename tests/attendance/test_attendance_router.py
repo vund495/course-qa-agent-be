@@ -879,6 +879,10 @@ def test_student_schedule_endpoint(client: TestClient, db_session: Session):
     assert mark_res.status_code == 200
 
     holiday_date = today + timedelta(days=1)
+    db_session.query(Holiday).filter(
+        Holiday.date >= past_date,
+        Holiday.date <= future_date,
+    ).delete(synchronize_session=False)
     db_session.add(
         Holiday(
             date=holiday_date,
