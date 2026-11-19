@@ -511,6 +511,8 @@ def list_email_queue(
             last_error=e.last_error,
             created_at=e.created_at,
             sent_at=e.sent_at,
+            last_attempt_at=e.last_attempt_at,
+            failed_at=e.failed_at,
         )
         for e in q.all()
     ]
