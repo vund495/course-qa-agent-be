@@ -324,6 +324,47 @@ def test_score_below_threshold_hands_question_to_internet_agent(db_session):
     assert answer.citations[0].url.startswith("https://docs.python.org/")
 
 
+def test_answer_web_results_uses_snippets_and_internet_prompt() -> None:
+    """The reusable web-only helper keeps the established SerpApi snippet flow."""
+
+    results = [
+        rag_service.WebResult(
+            title="Queue reference",
+            url="https://example.com/queues",
+            content="A queue is FIFO: enqueue at the back, dequeue from the front.",
+        )
+    ]
+    captured: dict[str, str] = {}
+
+    def generate(system_prompt: str, user_prompt: str) -> str:
+        captured["system"] = system_prompt
+        captured["user"] = user_prompt
+        return "A queue is FIFO [1]."
+
+    answer = rag_service.answer_web_results(
+        "What is a queue?",
+        results,
+        generate=generate,
+    )
+
+    assert "expert Academic Tutor" in captured["system"]
+    assert "Internet Sources" in captured["user"]
+    assert "A queue is FIFO" in captured["user"]
+    assert "https://example.com/queues" in captured["user"]
+    assert answer.source == rag_service.SOURCE_INTERNET
+    assert answer.used_web_search is True
+    assert answer.answer == "A queue is FIFO [1]."
+    assert len(answer.citations) == 1
+    assert answer.citations[0].kind == rag_service.SOURCE_INTERNET
+    assert answer.citations[0].url == "https://example.com/queues"
+    assert answer.citations[0].snippet.startswith("A queue is FIFO")
+
+
+def test_answer_web_results_requires_at_least_one_result() -> None:
+    with pytest.raises(ValueError):
+        rag_service.answer_web_results("What is a queue?", [])
+
+
 def test_threshold_change_switches_the_same_score_between_sources(db_session):
     """AC-05: raising/lowering the threshold changes the next question's route."""
 

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
 from app.schemas.history import (
+    ChatCitation,
     ChatDetailResponse,
     ChatMessageResponse,
     ChatSearchResponse,
@@ -16,11 +17,12 @@ from app.schemas.history import (
     ChatSessionResponse,
     DeleteSessionResponse,
     MessageCreateRequest,
+    PendingWebConsent,
     SessionCreateRequest,
     SessionPinRequest,
     SessionRenameRequest,
 )
-from app.services import history_service
+from app.services import history_service, web_consent_service
 
 router = APIRouter(prefix="/api/history", tags=["history"])
 
@@ -83,7 +85,29 @@ def get_session_detail(
         session_id=session_id,
         user_id=current_user.id,
     )
-    return session
+    detail = ChatDetailResponse.model_validate(session)
+    offer = web_consent_service.get_pending_offer(
+        db,
+        user_id=current_user.id,
+        class_id=session.class_id,
+        session_id=session.id,
+    )
+    if offer is not None:
+        detail.pending_consent = PendingWebConsent(
+            id=offer.id,
+            session_id=offer.session_id,
+            scope_kind=offer.scope_kind,  # type: ignore[arg-type]
+            question=offer.question,
+            query_scope=list(offer.scope_segments or []),
+            conflict_note=offer.conflict_note,
+            conflict_citations=[
+                ChatCitation.model_validate(citation)
+                for citation in (offer.conflict_citations or [])
+            ],
+            expires_at=offer.expires_at,
+            assistant_message_id=offer.assistant_message_id,
+        )
+    return detail
 
 
 @router.post("/sessions", response_model=ChatSessionResponse, status_code=status.HTTP_201_CREATED)

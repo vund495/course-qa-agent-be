@@ -13,7 +13,11 @@ UPSTREAM_ABSENCE_REVISION = "0046_absence_handover"
 SYLLABUS_MERGE_REVISION = "0047_merge_syllabus_handover"
 ADMIN_LEAVE_REVISION = "0047_admin_leave"
 MERGE_REVISION = "0048_merge_syllabus_admin_leave"
-HEAD_REVISION = "0050_ticket_attachment_names"
+CHAT_WEB_CONSENT_REVISION = "0049_chat_web_consent"
+TICKET_ATTACHMENT_NAMES_REVISION = "0050_ticket_attachment_names"
+CONSENT_ATTACHMENTS_MERGE_REVISION = "0051_merge_consent_attachments"
+EMAIL_OUTBOX_REVISION = "0051_email_outbox_timeline"
+HEAD_REVISION = "0052_merge_email_outbox_consent"
 
 BASELINE_DDL = (
     'CREATE TABLE "user" (id CHAR(32) PRIMARY KEY)',
@@ -71,6 +75,40 @@ def _insert_syllabus_sentinel(engine) -> tuple[str, str]:
             {"document_id": document_id},
         )
     return unit_id, document_id
+
+
+def _create_email_outbox_with_sentinel(engine) -> str:
+    message_id = uuid.uuid4().hex
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "CREATE TABLE email_outbox ("
+                "id CHAR(32) PRIMARY KEY, created_at DATETIME, sent_at DATETIME)"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO email_outbox (id, created_at, sent_at)"
+                " VALUES (:id, CURRENT_TIMESTAMP, NULL)"
+            ),
+            {"id": message_id},
+        )
+    return message_id
+
+
+def _assert_email_outbox_migrated(url: str, message_id: str) -> None:
+    engine = sa.create_engine(url)
+    with engine.connect() as conn:
+        version = conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+        assert version == HEAD_REVISION
+        columns = {column["name"] for column in sa.inspect(conn).get_columns("email_outbox")}
+        assert {"last_attempt_at", "failed_at"} <= columns
+        preserved = conn.execute(
+            sa.text("SELECT id FROM email_outbox WHERE id = :id"),
+            {"id": message_id},
+        ).scalar_one_or_none()
+        assert preserved == message_id
+    engine.dispose()
 
 
 def test_upgrade_from_legacy_syllabus_revision_preserves_data(tmp_path):
@@ -172,12 +210,53 @@ def test_upgrade_from_upstream_absence_head_adds_syllabus_schema(tmp_path):
     engine.dispose()
 
 
+def test_upgrade_from_ai194_consent_head_applies_email_outbox_columns(tmp_path):
+    """An existing AI-194 head must still run the upstream email migration."""
+    cfg, url = _prepare_branch_point(tmp_path, "ai194_consent_head.db")
+    command.upgrade(cfg, CONSENT_ATTACHMENTS_MERGE_REVISION)
+
+    engine = sa.create_engine(url)
+    message_id = _create_email_outbox_with_sentinel(engine)
+    engine.dispose()
+
+    command.upgrade(cfg, "head")
+
+    _assert_email_outbox_migrated(url, message_id)
+
+
+def test_upgrade_from_upstream_email_head_reaches_merge_head(tmp_path):
+    """An existing upstream email head must reach the new merge with data intact."""
+    cfg, url = _prepare_branch_point(tmp_path, "upstream_email_head.db")
+    command.upgrade(cfg, TICKET_ATTACHMENT_NAMES_REVISION)
+
+    engine = sa.create_engine(url)
+    message_id = _create_email_outbox_with_sentinel(engine)
+    engine.dispose()
+
+    command.upgrade(cfg, EMAIL_OUTBOX_REVISION)
+    command.upgrade(cfg, "head")
+
+    _assert_email_outbox_migrated(url, message_id)
+
+
 def test_graph_is_a_single_merge_head():
     """The graph must expose exactly one head that joins both feature branches."""
     cfg = Config("alembic.ini")
     script = ScriptDirectory.from_config(cfg)
 
     assert script.get_heads() == [HEAD_REVISION]
+    head = script.get_revision(HEAD_REVISION)
+    assert set(head.down_revision) == {
+        CONSENT_ATTACHMENTS_MERGE_REVISION,
+        EMAIL_OUTBOX_REVISION,
+    }
+    consent_merge = script.get_revision(CONSENT_ATTACHMENTS_MERGE_REVISION)
+    assert set(consent_merge.down_revision) == {
+        CHAT_WEB_CONSENT_REVISION,
+        TICKET_ATTACHMENT_NAMES_REVISION,
+    }
+    email_outbox = script.get_revision(EMAIL_OUTBOX_REVISION)
+    assert email_outbox.down_revision == TICKET_ATTACHMENT_NAMES_REVISION
     merge = script.get_revision(MERGE_REVISION)
     assert set(merge.down_revision) == {
         SYLLABUS_MERGE_REVISION,
