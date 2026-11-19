@@ -1,11 +1,9 @@
-"""Class scope decision: provider selection, structured output, fail-open."""
+"""Tests for the Gemini Decisions API scope gate."""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import time
-from collections.abc import Generator
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -14,73 +12,56 @@ from pydantic import SecretStr
 from app.services import decision_service
 
 
-@pytest.fixture(autouse=True)
-def _clear_decision_cooldown() -> Generator[None, None, None]:
-    decision_service.reset_failure_state()
-    yield
-    decision_service.reset_failure_state()
-
-
-def _class_question():
-    return decision_service.is_confidently_out_of_scope(
-        class_name="C++ Basic",
-        class_description="Introductory C++ course",
-        question="How do Python lists work?",
-        history="Student: what is a pointer\nAssistant: a pointer holds an address",
+def _answer(
+    kind: str,
+    *,
+    choice: str | None = None,
+    confidence: float | None = 0.9,
+    noul: float | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        type=kind,
+        choice=choice,
+        confidence=confidence,
+        noul=noul,
     )
 
 
-def _use_gemini(
-    monkeypatch,
+def _response(
+    verdict: str = "out_of_scope",
     *,
-    parsed=None,
-    text: str | None = None,
-    error: Exception | None = None,
-    captured: dict | None = None,
-) -> None:
-    captured = captured if captured is not None else {}
+    confidence: float | None = 0.94,
+    related: float | None = 0.8,
+    homework: float | None = 0.2,
+    answers: dict | None = None,
+) -> SimpleNamespace:
+    if answers is None:
+        answers = {
+            "verdict": _answer("choice", choice=verdict, confidence=confidence),
+            "is_related_tech": _answer("noul", confidence=0.8, noul=related),
+            "is_homework_request": _answer("noul", confidence=0.8, noul=homework),
+        }
+    return SimpleNamespace(answers=answers)
 
-    class FakeModels:
-        async def generate_content(self, **kwargs):
-            captured["call"] = kwargs
+
+def _use_gemini(monkeypatch, *, response=None, error=None, outcomes=None) -> dict:
+    captured: dict = {"calls": [], "clients": []}
+
+    class FakeDecisions:
+        async def create(self, **kwargs):
+            captured["calls"].append(kwargs)
+            if outcomes is not None:
+                outcome = outcomes[len(captured["calls"]) - 1]
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
             if error is not None:
                 raise error
-            return SimpleNamespace(parsed=parsed, text=text)
+            return response or _response()
 
     class FakeAio:
         def __init__(self) -> None:
-            self.models = FakeModels()
-            self.closed = False
-
-        async def aclose(self) -> None:
-            self.closed = True
-
-    class FakeClient:
-        def __init__(self, **kwargs) -> None:
-            captured["client"] = kwargs
-            self.aio = FakeAio()
-
-    monkeypatch.setattr(decision_service.genai, "Client", FakeClient)
-    monkeypatch.setattr(decision_service.settings, "decision_provider", "gemini")
-    monkeypatch.setattr(decision_service.settings, "google_api_key", SecretStr("secret"))
-
-
-def _use_gemini_sequence(monkeypatch, outcomes: list[object]) -> dict:
-    """Answer each Gemini attempt from a scripted list of outcomes."""
-
-    captured: dict[str, list] = {"calls": [], "clients": []}
-
-    class FakeModels:
-        async def generate_content(self, **kwargs):
-            captured["calls"].append(kwargs)
-            outcome = outcomes[len(captured["calls"]) - 1]
-            if isinstance(outcome, Exception):
-                raise outcome
-            return SimpleNamespace(parsed=outcome, text=None)
-
-    class FakeAio:
-        def __init__(self) -> None:
-            self.models = FakeModels()
+            self.decisions = FakeDecisions()
 
         async def aclose(self) -> None:
             return None
@@ -91,210 +72,236 @@ def _use_gemini_sequence(monkeypatch, outcomes: list[object]) -> dict:
             self.aio = FakeAio()
 
     monkeypatch.setattr(decision_service.genai, "Client", FakeClient)
-    monkeypatch.setattr(decision_service.settings, "decision_provider", "gemini")
     monkeypatch.setattr(decision_service.settings, "google_api_key", SecretStr("secret"))
+    monkeypatch.setattr(decision_service.settings, "decision_timeout_seconds", 12.0)
+    monkeypatch.setattr(decision_service.settings, "decision_key_attempts", 3)
+    async def empty_queries(*args, **kwargs):
+        return "{}"
+
+    monkeypatch.setattr(decision_service.gateway, "ainvoke_chat", empty_queries)
     return captured
 
 
-def test_gemini_blocks_a_confident_out_of_scope(monkeypatch) -> None:
-    captured: dict = {}
-    _use_gemini(
+def _class_decision(**overrides):
+    arguments = {
+        "class_name": "C++ Basic",
+        "class_description": "Introductory C++ course",
+        "question": "How do Python lists work?",
+        "history": "Student: what is a pointer\nAssistant: a pointer holds an address",
+    }
+    arguments.update(overrides)
+    return decision_service.decide_scope(**arguments)
+
+
+def test_google_genai_sdk_exposes_async_decisions_api() -> None:
+    client = decision_service.genai.Client(api_key="test-key")
+    try:
+        assert callable(client.aio.decisions.create)
+    finally:
+        asyncio.run(client.aio.aclose())
+
+
+def test_one_decisions_request_returns_all_three_signals_and_keeps_context(monkeypatch):
+    captured = _use_gemini(
         monkeypatch,
-        parsed=decision_service.ScopeDecision(verdict="out_of_scope", confidence=0.94),
-        captured=captured,
+        response=_response(confidence=0.93, related=0.75, homework=0.51),
     )
 
-    assert asyncio.run(_class_question()) is True
-
-    call = captured["call"]
-    assert call["model"] == decision_service.settings.decision_model
-    config = call["config"]
-    assert config.response_mime_type == "application/json"
-    assert config.response_schema is decision_service.ScopeDecision
-    assert config.max_output_tokens == decision_service.settings.decision_max_output_tokens
-    assert "syllabus" in config.system_instruction
-    assert "C++ Basic" in call["contents"]
-    assert "Introductory C++ course" in call["contents"]
-    assert "How do Python lists work?" in call["contents"]
-    assert "a pointer holds an address" in call["contents"]
-    assert captured["client"]["api_key"] == "secret"
-    expected_timeout = decision_service._primary_timeout(
-        decision_service.settings.decision_timeout_seconds,
-        decision_service.settings.decision_fallback_model,
-    )
-    # The SDK refuses a manual deadline below 10s; asyncio.wait_for enforces
-    # the real (possibly shorter) per-attempt budget.
-    assert captured["client"]["http_options"].timeout == max(10_000, int(expected_timeout * 1000))
-    assert captured["client"]["http_options"].retry_options.attempts == 1
-
-
-def test_gemini_allows_an_in_scope_question(monkeypatch) -> None:
-    _use_gemini(
-        monkeypatch,
-        parsed=decision_service.ScopeDecision(verdict="in_scope", confidence=0.97),
+    decision = asyncio.run(
+        _class_decision(
+            top_chunk_snippet="A Python list is mutable and ordered.",
+            has_code=True,
+            code_snippet_truncated="items = [1, 2]",
+        )
     )
 
-    assert asyncio.run(_class_question()) is False
-
-
-def test_gemini_allows_an_uncertain_negative_verdict(monkeypatch) -> None:
-    _use_gemini(
-        monkeypatch,
-        parsed=decision_service.ScopeDecision(verdict="out_of_scope", confidence=0.55),
-    )
-
-    assert asyncio.run(_class_question()) is False
-
-
-def test_gemini_honours_the_configured_threshold(monkeypatch) -> None:
-    _use_gemini(
-        monkeypatch,
-        parsed=decision_service.ScopeDecision(verdict="out_of_scope", confidence=0.9),
-    )
-    monkeypatch.setattr(
-        decision_service.settings,
-        "decision_confidence_threshold",
-        0.95,
-    )
-
-    assert asyncio.run(_class_question()) is False
-
-
-def test_gemini_parses_a_text_payload_when_parsed_is_empty(monkeypatch) -> None:
-    _use_gemini(
-        monkeypatch,
-        parsed=None,
-        text=json.dumps({"verdict": "out_of_scope", "confidence": 0.91}),
-    )
-
-    assert asyncio.run(_class_question()) is True
-
-
-def test_gemini_is_disabled_without_a_key(monkeypatch) -> None:
-    class ExplodingClient:
-        def __init__(self, **kwargs) -> None:
-            raise AssertionError("no client may be built without a key")
-
-    monkeypatch.setattr(decision_service.genai, "Client", ExplodingClient)
-    monkeypatch.setattr(decision_service.settings, "decision_provider", "gemini")
-    monkeypatch.setattr(decision_service.settings, "google_api_key", None)
-
-    assert asyncio.run(_class_question()) is False
-
-
-def test_gemini_fails_open_when_the_provider_errors(monkeypatch) -> None:
-    _use_gemini(monkeypatch, error=RuntimeError("provider down"))
-
-    assert asyncio.run(_class_question()) is False
-
-
-def test_gemini_fails_open_on_a_malformed_payload(monkeypatch) -> None:
-    _use_gemini(monkeypatch, parsed=None, text="not json")
-
-    assert asyncio.run(_class_question()) is False
-
-
-def test_gemini_fails_open_on_an_unknown_verdict(monkeypatch) -> None:
-    _use_gemini(
-        monkeypatch,
-        parsed=None,
-        text=json.dumps({"verdict": "maybe", "confidence": 0.99}),
-    )
-
-    assert asyncio.run(_class_question()) is False
-
-
-def test_gemini_uses_the_fallback_model_after_a_primary_failure(monkeypatch) -> None:
-    captured = _use_gemini_sequence(
-        monkeypatch,
-        [
-            RuntimeError("503 UNAVAILABLE"),
-            decision_service.ScopeDecision(verdict="out_of_scope", confidence=0.93),
-        ],
-    )
-
-    assert asyncio.run(_class_question()) is True
-
-    models = [call["model"] for call in captured["calls"]]
-    assert models == [
-        decision_service.settings.decision_model,
-        decision_service.settings.decision_fallback_model,
-    ]
-    assert decision_service._cooldown_remaining() > 0
-
-
-def test_gemini_skips_a_primary_model_in_cooldown(monkeypatch) -> None:
-    captured = _use_gemini_sequence(
-        monkeypatch,
-        [decision_service.ScopeDecision(verdict="in_scope", confidence=0.9)],
-    )
-    decision_service._start_cooldown()
-
-    assert asyncio.run(_class_question()) is False
-
-    models = [call["model"] for call in captured["calls"]]
-    assert models == [decision_service.settings.decision_fallback_model]
-
-
-def test_gemini_fails_open_when_primary_and_fallback_fail(monkeypatch) -> None:
-    captured = _use_gemini_sequence(
-        monkeypatch,
-        [RuntimeError("503 UNAVAILABLE"), TimeoutError("fallback slow")],
-    )
-
-    assert asyncio.run(_class_question()) is False
-    assert len(captured["calls"]) == 2
-
-
-def test_fallback_can_be_disabled(monkeypatch) -> None:
-    captured = _use_gemini_sequence(monkeypatch, [RuntimeError("503 UNAVAILABLE")])
-    monkeypatch.setattr(decision_service.settings, "decision_fallback_enabled", False)
-
-    assert asyncio.run(_class_question()) is False
     assert len(captured["calls"]) == 1
+    assert captured["calls"][0]["model"] == "gemini-decision-1"
+    call_input = captured["calls"][0]["input"]
+    for context in (
+        "C++ Basic",
+        "Introductory C++ course",
+        "A Python list is mutable and ordered.",
+        "what is a pointer",
+        "How do Python lists work?",
+        "items = [1, 2]",
+    ):
+        assert context in call_input
+
+    questions = captured["calls"][0]["questions"]
+    assert set(questions) == {"verdict", "is_related_tech", "is_homework_request"}
+    assert questions["verdict"]["type"] == "choice"
+    assert set(questions["verdict"]["criteria"]) == {
+        "core",
+        "comparison",
+        "extension",
+        "logistics",
+        "out_of_scope",
+    }
+    assert questions["is_related_tech"]["type"] == "noul"
+    assert questions["is_homework_request"]["type"] == "noul"
+    assert captured["clients"][0]["api_key"] == "secret"
+    assert captured["clients"][0]["http_options"].api_version == "v1beta"
+
+    assert decision.verdict == "out_of_scope"
+    assert decision.confidence == pytest.approx(0.93)
+    assert decision.is_related_tech is True
+    assert decision.is_homework_request is True
+    assert decision.reasoning == ""
 
 
-def test_primary_budget_reserves_time_for_the_fallback(monkeypatch) -> None:
-    captured = _use_gemini_sequence(
+@pytest.mark.parametrize(
+    "verdict",
+    ["core", "comparison", "extension", "logistics", "out_of_scope"],
+)
+def test_choice_answer_maps_to_scope_verdict(monkeypatch, verdict: str):
+    _use_gemini(monkeypatch, response=_response(verdict=verdict))
+
+    decision = asyncio.run(_class_decision())
+
+    assert decision is not None
+    assert decision.verdict == verdict
+
+
+@pytest.mark.parametrize(
+    ("confidence", "expected"),
+    [(0.79, False), (0.8, True), (0.95, True)],
+)
+def test_choice_confidence_uses_existing_scope_threshold(monkeypatch, confidence, expected):
+    _use_gemini(monkeypatch, response=_response(confidence=confidence))
+
+    decision = asyncio.run(_class_decision())
+
+    assert decision_service._is_confident_out_of_scope(decision) is expected
+
+
+@pytest.mark.parametrize(
+    ("related", "homework", "expected_related", "expected_homework"),
+    [(0.49, 0.5, False, True), (0.5, 0.49, True, False)],
+)
+def test_noul_probabilities_use_half_threshold(
+    monkeypatch, related, homework, expected_related, expected_homework
+):
+    _use_gemini(
         monkeypatch,
-        [decision_service.ScopeDecision(verdict="in_scope", confidence=0.9)],
+        response=_response(related=related, homework=homework),
     )
 
-    asyncio.run(_class_question())
+    decision = asyncio.run(_class_decision())
 
-    expected = decision_service._primary_timeout(
-        decision_service.settings.decision_timeout_seconds,
-        decision_service.settings.decision_fallback_model,
-    )
-    assert expected < decision_service.settings.decision_timeout_seconds
-    assert captured["clients"][0]["http_options"].timeout == max(10_000, int(expected * 1000))
+    assert decision.is_related_tech is expected_related
+    assert decision.is_homework_request is expected_homework
 
 
-def test_cooldown_expiry_retries_the_primary_model(monkeypatch) -> None:
-    captured = _use_gemini_sequence(
+@pytest.mark.parametrize(
+    "answers",
+    [
+        {},
+        {"verdict": _answer("noul", noul=0.9)},
+        {
+            "verdict": _answer("choice", choice="unknown", confidence=0.99),
+            "is_related_tech": _answer("noul", noul=0.2),
+            "is_homework_request": _answer("noul", noul=0.2),
+        },
+        {
+            "verdict": _answer("choice", choice="core", confidence=None),
+            "is_related_tech": _answer("noul", noul=0.2),
+            "is_homework_request": _answer("noul", noul=0.2),
+        },
+        {
+            "verdict": _answer("choice", choice="core", confidence=0.9),
+            "is_related_tech": _answer("noul", noul=1.2),
+            "is_homework_request": _answer("noul", noul=0.2),
+        },
+    ],
+)
+def test_invalid_or_incomplete_decisions_fail_open(monkeypatch, answers):
+    _use_gemini(monkeypatch, response=_response(answers=answers))
+
+    decision = asyncio.run(_class_decision())
+
+    assert decision is None
+    assert decision_service._is_confident_out_of_scope(decision) is False
+
+
+def test_scope_provider_failure_has_no_model_fallback_or_cooldown(monkeypatch):
+    captured = _use_gemini(monkeypatch, error=RuntimeError("503 unavailable"))
+
+    first = asyncio.run(_class_decision())
+    second = asyncio.run(_class_decision())
+
+    assert first is None
+    assert second is None
+    assert len(captured["calls"]) == 2
+    assert all(call["model"] == "gemini-decision-1" for call in captured["calls"])
+
+
+def test_key_rotation_retries_next_pool_key(monkeypatch):
+    key_ids = [uuid.uuid4(), uuid.uuid4()]
+    records = [
+        SimpleNamespace(key_id=key_ids[0], key_name="first"),
+        SimpleNamespace(key_id=key_ids[1], key_name="second"),
+    ]
+    resolved: list[set] = []
+    failed: list[object] = []
+    succeeded: list[object] = []
+    captured = _use_gemini(
         monkeypatch,
-        [decision_service.ScopeDecision(verdict="in_scope", confidence=0.9)],
+        outcomes=[RuntimeError("503 unavailable"), _response("core")],
+    )
+    monkeypatch.setattr(decision_service.settings, "decision_key_attempts", 2)
+
+    def resolve_key(provider, model, db, excluded):
+        resolved.append(set(excluded))
+        index = len(resolved) - 1
+        return f"key-{index + 1}", records[index]
+
+    monkeypatch.setattr(decision_service, "_resolve_key", resolve_key)
+    monkeypatch.setattr(
+        decision_service,
+        "_record_failure",
+        lambda provider, db, record, error: failed.append(record),
     )
     monkeypatch.setattr(
         decision_service,
-        "_primary_cooldown_until",
-        time.monotonic() - 0.01,
+        "_record_success",
+        lambda provider, db, record: succeeded.append(record),
     )
 
-    assert asyncio.run(_class_question()) is False
+    decision = asyncio.run(_class_decision(db=object()))
 
-    models = [call["model"] for call in captured["calls"]]
-    assert models == [decision_service.settings.decision_model]
-    assert decision_service._cooldown_remaining() == 0
+    assert decision.verdict == "core"
+    assert len(captured["calls"]) == 2
+    assert failed == [records[0]]
+    assert succeeded == [records[1]]
+    assert resolved == [set(), {key_ids[0]}]
 
 
-def test_gemini_client_never_goes_below_the_sdk_minimum_deadline(monkeypatch) -> None:
-    captured = _use_gemini_sequence(
-        monkeypatch,
-        [decision_service.ScopeDecision(verdict="in_scope", confidence=0.9)],
-    )
+@pytest.mark.parametrize("payload", ['{"external_search_query":"Python list methods","search_query_en":"Python list operations"}', "invalid"])
+def test_scope_queries_use_separate_model_and_fail_open(monkeypatch, payload):
+    _use_gemini(monkeypatch, response=_response(verdict="core"))
+    calls = []
 
-    asyncio.run(_class_question())
+    async def query_model(db, messages, **kwargs):
+        calls.append(kwargs["model"])
+        assert "How do Python lists work?" in messages[-1].content
+        return payload
 
-    # Gemini rejects a manual HTTP deadline below 10s with 400 INVALID_ARGUMENT.
-    assert captured["clients"][0]["http_options"].timeout >= 10_000
+    monkeypatch.setattr(decision_service.gateway, "ainvoke_chat", query_model)
+    decision = asyncio.run(_class_decision())
+
+    assert calls == ["models/gemini-3.5-flash-lite"]
+    assert decision.verdict == "core"
+    assert decision.external_search_query == (None if payload == "invalid" else "Python list methods")
+    assert decision.search_query_en == (None if payload == "invalid" else "Python list operations")
+
+
+def test_scope_timeout_fails_open_without_query_generation(monkeypatch):
+    captured = _use_gemini(monkeypatch, error=TimeoutError("deadline expired"))
+
+    async def unexpected_query_call(*args, **kwargs):
+        pytest.fail("Query model should not run after a scope timeout")
+
+    monkeypatch.setattr(decision_service.gateway, "ainvoke_chat", unexpected_query_call)
+    assert asyncio.run(_class_decision()) is None
+    assert len(captured["calls"]) == 1

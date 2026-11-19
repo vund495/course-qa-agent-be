@@ -341,3 +341,37 @@ def test_gemini_key_routes_require_admin(api_client, db_session):
     ]:
         assert api_client.request(method, path, json={}).status_code == 401
         assert api_client.request(method, path, json={}, headers=student).status_code == 403
+
+
+def test_retrieval_config_test_expands_query_without_scope_gate(monkeypatch):
+    import asyncio
+    import uuid
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.routers.admin.router import test_retrieval_query
+    from app.schemas.admin import RetrievalTestRequest
+    from app.services import chat_retrieval_service, decision_service
+
+    async def generate(**kwargs):
+        assert kwargs["question"] == "Danh sách Python là gì?"
+        return decision_service.ScopeQueries(search_query_en="Python lists")
+
+    monkeypatch.setattr(decision_service, "generate_scope_queries", generate)
+    decide = AsyncMock()
+    monkeypatch.setattr(decision_service, "decide_scope", decide)
+    retrieve = MagicMock(return_value=SimpleNamespace(chunks=[], source="none", top_score=None))
+    monkeypatch.setattr(chat_retrieval_service, "retrieve_for_chat", retrieve)
+    db = MagicMock()
+    db.query.return_value.first.return_value = SimpleNamespace(
+        id=uuid.uuid4(), name="Python", code="PY"
+    )
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    result = asyncio.run(test_retrieval_query(
+        RetrievalTestRequest(question="Danh sách Python là gì?"), db=db, _=None
+    ))
+
+    assert result.search_query_en == "Python lists"
+    assert retrieve.call_args.kwargs["search_query_en"] == "Python lists"
+    decide.assert_not_called()

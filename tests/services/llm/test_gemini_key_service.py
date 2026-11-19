@@ -387,3 +387,13 @@ def test_gateway_raises_mid_stream_when_auto_switch_is_off(db_session, monkeypat
         )
 
     assert calls == ["AIzaSyPartial3333"]
+
+
+def test_scope_decisions_can_use_key_without_generative_model_listing(db_session):
+    key = keys.create_key(db_session, name="Decisions", api_key="AIzaSyDecisions4444")
+    assert keys.settings.decision_model not in key.available_models
+
+    resolved = keys.resolve_key(db_session, model=keys.settings.decision_model)
+
+    assert resolved is not None
+    assert resolved.key_id == key.id

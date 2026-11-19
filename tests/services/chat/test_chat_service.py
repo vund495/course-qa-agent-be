@@ -86,7 +86,14 @@ def test_stream_chat_emits_tokens_citations_and_done(monkeypatch) -> None:
                 content='["How does backpropagation update weights?", "Which activation functions are common?"]'
             )
 
-    _patch_curriculum(monkeypatch)
+    async def scope(**kwargs):
+        return chat_service.decision_service.ScopeDecision(search_query_en="neural network layers")
+
+    retrieval = MagicMock(return_value=_curriculum_decision())
+    citations = MagicMock(wraps=rag_service.cited_page_citations)
+    monkeypatch.setattr(chat_service, "_resolve_scope_decision", scope)
+    monkeypatch.setattr(chat_retrieval_service, "retrieve_for_chat", retrieval)
+    monkeypatch.setattr(rag_service, "cited_page_citations", citations)
 
     events = asyncio.run(
         _collect(
@@ -154,6 +161,9 @@ def test_stream_chat_emits_tokens_citations_and_done(monkeypatch) -> None:
     assert "A neural network contains connected layers." in rendered_prompt
     assert "Explain neural networks." in rendered_prompt
     assert "Every factual claim must end with the matching source marker" in rendered_prompt
+    assert retrieval.call_args.kwargs["search_query_en"] == "neural network layers"
+    assert citations.call_args.kwargs["question"] == "Explain neural networks.\nneural network layers"
+
 
 
 def test_confident_out_of_scope_skips_retrieval(monkeypatch) -> None:
@@ -374,8 +384,25 @@ def _no_source_decision() -> rag_service.RetrievalDecision:
     )
 
 
-def test_stream_chat_fails_closed_when_slides_and_web_have_no_evidence(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("english", "external", "expected"),
+    [
+        ("transformer attention", "transformer overview", "transformer attention"),
+        (None, "transformer overview", "transformer overview"),
+        (None, None, "What is a transformer?"),
+    ],
+)
+def test_stream_chat_fails_closed_when_slides_and_web_have_no_evidence(
+    monkeypatch, english, external, expected
+) -> None:
     """Low-zone CORE questions try the web; with no source at all the model is never called."""
+
+    async def scope(**kwargs):
+        return chat_service.decision_service.ScopeDecision(
+            search_query_en=english, external_search_query=external
+        )
+
+    monkeypatch.setattr(chat_service, "_resolve_scope_decision", scope)
 
     class ExplodingModel:
         async def astream(self, messages):
@@ -412,7 +439,7 @@ def test_stream_chat_fails_closed_when_slides_and_web_have_no_evidence(monkeypat
     assert events[1][1] == {"stage": "searching", "message": "Searching class materials"}
     assert events[2][1] == {"stage": "searching", "message": "Searching the web"}
     assert events[3][1] == {"text": rag_service.NO_SOURCE_MESSAGE}
-    assert searched == ["What is a transformer?"]
+    assert searched == [expected]
     assert events[4][1]["used_web_search"] is True
 
 
