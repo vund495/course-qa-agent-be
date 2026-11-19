@@ -19,10 +19,10 @@ def _record(path, status="processing"):
     )
 
 
-def test_process_document_indexes_chunks_and_marks_document_indexed(monkeypatch, tmp_path):
+def test_process_document_indexes_unrelated_material_and_marks_document_indexed(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "document_storage_dir", tmp_path)
     path = tmp_path / "lesson.txt"
-    path.write_text("lesson", encoding="utf-8")
+    path.write_text("Kitchen recipes", encoding="utf-8")
     record = _record(path)
     db = MagicMock()
     chunks = [SimpleNamespace(page_content="lesson text", metadata={})]
@@ -36,7 +36,7 @@ def test_process_document_indexes_chunks_and_marks_document_indexed(monkeypatch,
         db.commit()
 
     monkeypatch.setattr(document_service, "supersede_older_versions", activate)
-    monkeypatch.setattr(ingestion_service, "_load_document", lambda _path: {"markdown": "# Lesson\nText", "images": {}})
+    monkeypatch.setattr(ingestion_service, "_load_document", lambda _path: {"markdown": "# Kitchen recipes\nBread dough", "images": {}})
     monkeypatch.setattr(ingestion_service, "QdrantStore", lambda embeddings: qdrant)
     monkeypatch.setattr(ingestion_service, "GeminiEmbedding", lambda **_: object())
     monkeypatch.setattr(ingestion_service, "markdown_chunker", lambda _text, metadata: chunks)
@@ -48,6 +48,7 @@ def test_process_document_indexes_chunks_and_marks_document_indexed(monkeypatch,
     assert chunks[0].metadata["chunk_index"] == 0
     assert qdrant.add_documents.call_args.args[0] == chunks
     db.commit.assert_called_once()
+    db.get.assert_not_called()
 
 
 def test_process_document_indexes_generic_xlsx_with_sheet_row_locator(monkeypatch, tmp_path):

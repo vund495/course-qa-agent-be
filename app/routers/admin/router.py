@@ -614,17 +614,16 @@ async def test_retrieval_query(
         info = db.query(ClassInfo).filter(ClassInfo.class_id == target_class.id).first()
         class_description = info.description if info else None
 
-        scope_decision = await decision_service.decide_scope(
+        scope_queries = await decision_service.generate_scope_queries(
             class_name=target_class.name or target_class.code,
             class_description=class_description,
             question=payload.question,
             db=db,
         )
-        if scope_decision and scope_decision.search_query_en:
-            search_query_en = scope_decision.search_query_en
+        search_query_en = scope_queries.search_query_en
     except Exception:
         logger.warning(
-            "Admin retrieval scope decision failed; using the original query.", exc_info=True
+            "Admin retrieval query generation failed; using the original query.", exc_info=True
         )
 
     decision = chat_retrieval_service.retrieve_for_chat(

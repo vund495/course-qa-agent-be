@@ -20,7 +20,7 @@ from app.main import app
 from app.models.course import Class
 from app.models.document import Document
 from app.models.user import User
-from app.services import document_service, document_validation_service, ingestion_service
+from app.services import document_service, ingestion_service
 
 SYLLABUS_MARKDOWN = """# Python Course Syllabus
 
@@ -71,11 +71,6 @@ def db_session(monkeypatch, tmp_path):
 @pytest.fixture()
 def client(db_session, monkeypatch):
     monkeypatch.setattr(ingestion_service, "process_document_in_background", lambda _id: None)
-    monkeypatch.setattr(
-        document_validation_service,
-        "validate_document_relevance",
-        lambda *args, **kwargs: (True, "Mocked relevance"),
-    )
 
     def _load(path):
         return {"markdown": Path(path).read_text(encoding="utf-8")}
@@ -893,15 +888,7 @@ def test_reupload_draft_keeps_active_units_and_latest_preview(client, db_session
     assert [unit["unit_number"] for unit in preview.json()["units"]] == [1, 2]
 
 
-def test_teacher_syllabus_and_unit_upload_skip_ai_relevance(client, db_session, monkeypatch):
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("Relevance validation must not run for trainer uploads.")
-
-    monkeypatch.setattr(
-        document_validation_service,
-        "validate_document_relevance",
-        fail_if_called,
-    )
+def test_teacher_syllabus_and_unit_upload(client, db_session):
     headers = _headers(client)
     clazz = _class(db_session)
 
@@ -928,17 +915,7 @@ def test_teacher_syllabus_and_unit_upload_skip_ai_relevance(client, db_session, 
     assert record.syllabus_unit_number == 1
 
 
-def test_teacher_invalid_syllabus_still_rejected_without_ai_relevance(
-    client, db_session, monkeypatch
-):
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("Relevance validation must not run for trainer uploads.")
-
-    monkeypatch.setattr(
-        document_validation_service,
-        "validate_document_relevance",
-        fail_if_called,
-    )
+def test_teacher_invalid_syllabus_still_rejected(client, db_session):
     headers = _headers(client)
     clazz = _class(db_session)
 

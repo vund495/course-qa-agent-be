@@ -103,14 +103,9 @@ def _seed_classes(db: Session) -> None:
 @pytest.fixture()
 def client(db_session, monkeypatch):
     # Route-level lifecycle tests exercise scheduling without calling Gemini/Qdrant.
-    from app.services import document_validation_service, ingestion_service
+    from app.services import ingestion_service
 
     monkeypatch.setattr(ingestion_service, "process_document_in_background", lambda _id: None)
-    monkeypatch.setattr(
-        document_validation_service,
-        "validate_document_relevance",
-        lambda *args, **kwargs: (True, "Mocked relevance"),
-    )
 
     def _override():
         try:
@@ -189,17 +184,7 @@ def test_upload_pdf_is_pending_approval(client, trainer_headers):
     assert result["document"]["class_id"] == class_a
 
 
-def test_trainer_upload_skips_ai_relevance_gate(client, trainer_headers, monkeypatch):
-    from app.services import document_validation_service
-
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("Relevance validation must not run for trainer uploads.")
-
-    monkeypatch.setattr(
-        document_validation_service,
-        "validate_document_relevance",
-        fail_if_called,
-    )
+def test_trainer_upload_accepts_unrelated_material(client, trainer_headers):
     class_a = _class_id(client, trainer_headers, "CS101-A")
     response = client.post(
         "/api/documents/",
@@ -214,20 +199,7 @@ def test_trainer_upload_skips_ai_relevance_gate(client, trainer_headers, monkeyp
     assert result["document"]["status"] == "pending"
 
 
-def test_admin_upload_keeps_relevance_gate(client, admin_headers, monkeypatch):
-    from app.services import document_validation_service
-
-    calls: list[str | None] = []
-
-    def reject_admin_upload(*args, **kwargs):
-        calls.append(kwargs.get("file_name"))
-        return False, "Admin relevance gate."
-
-    monkeypatch.setattr(
-        document_validation_service,
-        "validate_document_relevance",
-        reject_admin_upload,
-    )
+def test_admin_upload_accepts_unrelated_material(client, admin_headers):
     class_a = _class_id(client, admin_headers, "CS101-A")
     response = client.post(
         "/api/documents/",
@@ -238,9 +210,8 @@ def test_admin_upload_keeps_relevance_gate(client, admin_headers, monkeypatch):
 
     assert response.status_code == 201
     result = response.json()["uploaded"][0]
-    assert result["document"] is None
-    assert result["warning"] == "Admin relevance gate."
-    assert calls == ["admin-off-topic.pdf"]
+    assert result["error"] is None
+    assert result["document"]["status"] == "pending"
 
 
 def test_oversize_upload_still_rejected_at_route(client, trainer_headers, monkeypatch):

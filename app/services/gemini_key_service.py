@@ -303,6 +303,9 @@ def _supports_model(key: GeminiApiKey, model: str) -> bool:
     if not key.available_models:
         return True
     wanted = model_id(model)
+    # Decisions API models are not advertised by the generative Models API.
+    if wanted == model_id(settings.decision_model):
+        return True
     return any(model_id(candidate) == wanted for candidate in key.available_models)
 
 

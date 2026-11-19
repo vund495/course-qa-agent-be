@@ -22,9 +22,8 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db, require_trainer
-from app.models.course import Class
 from app.models.document import Document
-from app.models.user import Role, User
+from app.models.user import User
 from app.schemas.documents import (
     AcceptedTypeRead,
     AttachSyllabusMaterialRequest,
@@ -38,7 +37,7 @@ from app.schemas.documents import (
     TeacherSyllabusRead,
     TeacherSyllabusUnitRead,
 )
-from app.services import document_service, document_validation_service, ingestion_service
+from app.services import document_service, ingestion_service
 from app.services.document_service import ACCEPTED_EXTENSIONS, VALID_STATUSES
 from app.services.ingestion.syllabus_parser import (
     SyllabusFormatError,
@@ -55,18 +54,6 @@ def _require_uploader(record: Document, user: User) -> None:
             status_code=403,
             detail="Only the uploader can manage this document.",
         )
-
-
-def _role_name(db: Session, user: User) -> str:
-    role = getattr(user, "role", None)
-    if role is not None and getattr(role, "name", None):
-        return role.name
-    role = db.get(Role, user.role_id)
-    return role.name if role is not None else ""
-
-
-def _is_trainer(db: Session, user: User) -> bool:
-    return _role_name(db, user).upper() == "TRAINER"
 
 
 def _scoped_document(db: Session, document_id: str, user: User) -> Document:
@@ -187,11 +174,6 @@ async def upload_documents(
             else:
                 target = resolved
 
-    # Product policy: trainers own the class topic and take responsibility for
-    # the material they upload, so the AI relevance gate is admin-only. File
-    # type/size/content, class ownership, and syllabus parsing stay enforced.
-    skip_relevance_gate = _is_trainer(db, user)
-
     # Phase 1: create/parse every file first. The syllabus context must be
     # resolved after the whole batch exists, otherwise a material ordered
     # before its new syllabus would bind to NULL or a stale active syllabus.
@@ -210,8 +192,6 @@ async def upload_documents(
             continue
 
         doc_text = ""
-        # force only bypasses relevance validation; syllabus detection and
-        # draft parsing must always inspect the uploaded content.
         try:
             loaded = ingestion_service._load_document(document_service.document_path(record))
             doc_text = loaded.get("markdown", "")
@@ -228,29 +208,6 @@ async def upload_documents(
                 }
             )
             continue
-
-        if not force and not skip_relevance_gate:
-            clazz = db.get(Class, record.class_id)
-            if clazz:
-                class_desc = clazz.info.description if getattr(clazz, "info", None) else None
-                is_relevant, rejection_reason = document_validation_service.validate_document_relevance(
-                    db,
-                    class_name=clazz.name,
-                    class_code=clazz.code,
-                    class_description=class_desc,
-                    file_name=name,
-                    document_text=doc_text,
-                )
-                if not is_relevant:
-                    document_service.delete_document(db, record)
-                    prepared.append(
-                        {
-                            "name": name,
-                            "warning": rejection_reason
-                            or "Document content does not match course subject.",
-                        }
-                    )
-                    continue
 
         if uploaded_is_syllabus:
             record.is_syllabus = True
@@ -316,10 +273,6 @@ async def upload_documents(
     for entry in prepared:
         if "error" in entry:
             results.append(DocumentUploadResult(file_name=entry["name"], error=entry["error"]))
-        elif "warning" in entry:
-            results.append(
-                DocumentUploadResult(file_name=entry["name"], warning=entry["warning"])
-            )
         else:
             results.append(
                 DocumentUploadResult(
