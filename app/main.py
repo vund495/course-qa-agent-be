@@ -37,6 +37,7 @@ from app.routers.quizzes import router as quizzes_router
 from app.routers.quizzes import student_router as student_quizzes_router
 from app.routers.quizzes.results import router as quiz_results_router
 from app.routers.quizzes.student_results import router as student_quiz_results_router
+from app.routers.skills import admin_skills_router, catalog_router
 from app.routers.skills import router as skills_router
 from app.routers.student.router import router as student_router
 from app.routers.tickets import router as tickets_router
@@ -147,6 +148,8 @@ app.include_router(quiz_results_router)
 app.include_router(student_quiz_results_router)
 app.include_router(student_quizzes_router)
 app.include_router(skills_router)
+app.include_router(admin_skills_router)
+app.include_router(catalog_router)
 app.include_router(question_bank_router)
 app.include_router(categories_router)
 app.include_router(content_gaps_router)
