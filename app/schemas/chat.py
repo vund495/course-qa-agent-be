@@ -80,4 +80,5 @@ class WebConsentResult(BaseModel):
     status: Literal["accepted", "declined", "already_consumed"]
     answer: str | None = None
     citations: list[ChatCitation] = Field(default_factory=list)
+    suggested_questions: list[str] = Field(default_factory=list)
     assistant_message_id: uuid.UUID | None = None

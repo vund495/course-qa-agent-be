@@ -17,7 +17,7 @@ from sqlalchemy.pool import StaticPool
 
 from app import models  # noqa: F401 - register all tables
 from app.core.database import Base
-from app.models.chat import ChatMessage, ChatSession
+from app.models.chat import ChatMessage, ChatSession, ChatWebConsent
 from app.services import chat_context_service
 
 
@@ -82,6 +82,34 @@ def _add_exchange(
                 excluded_from_context=excluded_from_context,
             ),
         ]
+    )
+    db.commit()
+
+
+def _add_consent(
+    db: Session,
+    session: ChatSession,
+    *,
+    course: ChatMessage | None,
+    web: ChatMessage,
+    status: str = "consumed",
+) -> None:
+    now = datetime.now(UTC)
+    db.add(
+        ChatWebConsent(
+            user_id=session.user_id,
+            class_id=session.class_id,
+            session_id=session.id,
+            assistant_message_id=course.id if course is not None else None,
+            web_message_id=web.id,
+            scope_kind="missing",
+            question="question",
+            query_text="question",
+            scope_segments=["question"],
+            status=status,
+            expires_at=now + timedelta(minutes=30),
+            consumed_at=now if status == "consumed" else None,
+        )
     )
     db.commit()
 
@@ -429,3 +457,295 @@ def test_condense_question_stops_at_the_shared_deadline(monkeypatch) -> None:
     )
     # The shared deadline must not be extended by a fresh fallback timeout.
     assert elapsed < 1
+
+
+def test_load_recent_exchanges_prefers_consumed_web_answer_for_same_turn(
+    db_session: Session,
+) -> None:
+    session = _session(db_session)
+    now = datetime.now(UTC)
+    user = ChatMessage(
+        session_id=session.id,
+        role="USER",
+        content="Who discovered photosynthesis?",
+        created_at=now,
+    )
+    db_session.add(user)
+    db_session.flush()
+    course = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="Partial course answer.",
+        parent_message_id=user.id,
+        created_at=now + timedelta(milliseconds=1),
+    )
+    db_session.add(course)
+    db_session.flush()
+    web = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="Full web answer.",
+        used_web_search=True,
+        parent_message_id=course.id,
+        created_at=now + timedelta(seconds=1),
+    )
+    db_session.add(web)
+    db_session.flush()
+    db_session.add(
+        ChatWebConsent(
+            user_id=session.user_id,
+            class_id=session.class_id,
+            session_id=session.id,
+            assistant_message_id=course.id,
+            web_message_id=web.id,
+            scope_kind="missing",
+            question="Who discovered photosynthesis?",
+            query_text="Who discovered photosynthesis?",
+            scope_segments=["Who discovered photosynthesis?"],
+            status="consumed",
+            expires_at=now + timedelta(minutes=30),
+            consumed_at=now + timedelta(seconds=1),
+        )
+    )
+    db_session.commit()
+
+    history = chat_context_service.load_recent_exchanges(
+        db_session,
+        session_id=session.id,
+        user_id=session.user_id,
+        class_id=session.class_id,
+    )
+
+    assert len(history) == 1
+    assert history[0].user == "Who discovered photosynthesis?"
+    assert history[0].assistant == "Full web answer."
+
+
+def test_load_recent_exchanges_keeps_consumed_web_with_its_own_same_session_turn(
+    db_session: Session,
+) -> None:
+    session = _session(db_session)
+    now = datetime.now(UTC)
+    first_user = ChatMessage(
+        session_id=session.id,
+        role="USER",
+        content="first question",
+        created_at=now,
+    )
+    db_session.add(first_user)
+    db_session.flush()
+    first_course = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="first course answer",
+        parent_message_id=first_user.id,
+        created_at=now + timedelta(milliseconds=1),
+    )
+    db_session.add(first_course)
+    db_session.flush()
+    second_user = ChatMessage(
+        session_id=session.id,
+        role="USER",
+        content="second question",
+        created_at=now + timedelta(seconds=1),
+    )
+    db_session.add(second_user)
+    db_session.flush()
+    second_course = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="second course answer",
+        parent_message_id=second_user.id,
+        created_at=now + timedelta(seconds=1, milliseconds=1),
+    )
+    db_session.add(second_course)
+    db_session.flush()
+    first_web = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="first web answer",
+        used_web_search=True,
+        parent_message_id=first_course.id,
+        created_at=now + timedelta(seconds=2),
+    )
+    db_session.add(first_web)
+    db_session.flush()
+    _add_consent(db_session, session, course=first_course, web=first_web)
+
+    history = chat_context_service.load_recent_exchanges(
+        db_session,
+        session_id=session.id,
+        user_id=session.user_id,
+        class_id=session.class_id,
+    )
+
+    assert [exchange.user for exchange in history] == [
+        "first question",
+        "second question",
+    ]
+    assert [exchange.assistant for exchange in history] == [
+        "first web answer",
+        "second course answer",
+    ]
+
+
+def test_load_recent_exchanges_ignores_unconsumed_web_answers(db_session: Session) -> None:
+    session = _session(db_session)
+    now = datetime.now(UTC)
+    user = ChatMessage(
+        session_id=session.id,
+        role="USER",
+        content="question",
+        created_at=now,
+    )
+    db_session.add(user)
+    db_session.flush()
+    course = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="course answer",
+        parent_message_id=user.id,
+        created_at=now + timedelta(milliseconds=1),
+    )
+    db_session.add(course)
+    db_session.flush()
+    web = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="unconsumed web answer",
+        used_web_search=True,
+        parent_message_id=course.id,
+        created_at=now + timedelta(seconds=1),
+    )
+    db_session.add(web)
+    db_session.flush()
+    _add_consent(db_session, session, course=course, web=web, status="processing")
+
+    history = chat_context_service.load_recent_exchanges(
+        db_session,
+        session_id=session.id,
+        user_id=session.user_id,
+        class_id=session.class_id,
+    )
+
+    assert len(history) == 1
+    assert history[0].assistant == "course answer"
+
+
+def test_load_recent_exchanges_ignores_orphan_assistant_parent(db_session: Session) -> None:
+    session = _session(db_session)
+    now = datetime.now(UTC)
+    user = ChatMessage(
+        session_id=session.id,
+        role="USER",
+        content="question",
+        created_at=now,
+    )
+    db_session.add(user)
+    db_session.flush()
+    orphan = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="orphan answer",
+        parent_message_id=uuid.uuid4(),
+        created_at=now + timedelta(milliseconds=1),
+    )
+    db_session.add(orphan)
+    db_session.commit()
+
+    history = chat_context_service.load_recent_exchanges(
+        db_session,
+        session_id=session.id,
+        user_id=session.user_id,
+        class_id=session.class_id,
+    )
+
+    assert history == []
+
+
+def test_load_recent_exchanges_ignores_unconsumed_direct_user_web(db_session: Session) -> None:
+    session = _session(db_session)
+    now = datetime.now(UTC)
+    user = ChatMessage(
+        session_id=session.id,
+        role="USER",
+        content="question",
+        created_at=now,
+    )
+    db_session.add(user)
+    db_session.flush()
+    web = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="unconsumed direct web",
+        used_web_search=True,
+        parent_message_id=user.id,
+        created_at=now + timedelta(seconds=1),
+    )
+    db_session.add(web)
+    db_session.flush()
+    _add_consent(db_session, session, course=None, web=web, status="processing")
+
+    history = chat_context_service.load_recent_exchanges(
+        db_session,
+        session_id=session.id,
+        user_id=session.user_id,
+        class_id=session.class_id,
+    )
+
+    assert history == []
+
+
+def test_load_recent_exchanges_keeps_interleaved_direct_user_parent_legacy_web(
+    db_session: Session,
+) -> None:
+    session = _session(db_session)
+    now = datetime.now(UTC)
+    first_user = ChatMessage(
+        session_id=session.id,
+        role="USER",
+        content="legacy A",
+        created_at=now,
+    )
+    db_session.add(first_user)
+    db_session.flush()
+    second_user = ChatMessage(
+        session_id=session.id,
+        role="USER",
+        content="question B",
+        created_at=now + timedelta(seconds=1),
+    )
+    db_session.add(second_user)
+    db_session.flush()
+    second_course = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="course B",
+        parent_message_id=second_user.id,
+        created_at=now + timedelta(seconds=1, milliseconds=1),
+    )
+    db_session.add(second_course)
+    db_session.flush()
+    legacy_web_a = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="legacy web A",
+        used_web_search=True,
+        parent_message_id=first_user.id,
+        created_at=now + timedelta(seconds=2),
+    )
+    db_session.add(legacy_web_a)
+    db_session.commit()
+
+    history = chat_context_service.load_recent_exchanges(
+        db_session,
+        session_id=session.id,
+        user_id=session.user_id,
+        class_id=session.class_id,
+    )
+
+    assert [exchange.user for exchange in history] == ["legacy A", "question B"]
+    assert [exchange.assistant for exchange in history] == [
+        "legacy web A",
+        "course B",
+    ]

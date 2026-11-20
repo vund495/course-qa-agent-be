@@ -24,6 +24,7 @@ from app.services import (
     rag_service,
     strict_chat_service,
     strict_web_service,
+    suggestion_service,
     web_consent_service,
 )
 from app.services.llm import gateway
@@ -462,6 +463,16 @@ def test_accept_runs_isolated_web_step_and_persists_separate_answer(
     monkeypatch.setattr(rag_service, "decide_source", must_not_run)
     monkeypatch.setattr(chat_retrieval_service, "retrieve_for_chat", must_not_run)
 
+    suggestion_calls: dict = {}
+
+    async def fake_suggestions(**kwargs):
+        suggestion_calls.update(kwargs)
+        return ["What about queues?"]
+
+    monkeypatch.setattr(
+        suggestion_service, "generate_followup_questions", fake_suggestions
+    )
+
     stream = asyncio.run(
         strict_chat_service.decide_consent(
             db=db,
@@ -481,6 +492,7 @@ def test_accept_runs_isolated_web_step_and_persists_separate_answer(
         "token",
         "token",
         "citation",
+        "suggestions",
         "done",
     ]
     assert events[0][1]["message"] == "Searching the web"
@@ -488,9 +500,14 @@ def test_accept_runs_isolated_web_step_and_persists_separate_answer(
         "**Web answer [1]."
     )
     assert events[4][1]["url"] == "https://example.com/reference"
-    assert events[5][1]["source"] == rag_service.SOURCE_INTERNET
-    assert events[5][1]["used_web_search"] is True
-    assert events[5][1]["assistant_message_id"]
+    assert events[5][1] == {"questions": ["What about queues?"]}
+    assert events[6][1]["source"] == rag_service.SOURCE_INTERNET
+    assert events[6][1]["used_web_search"] is True
+    assert events[6][1]["assistant_message_id"]
+    assert events[6][1]["suggested_questions"] == ["What about queues?"]
+    assert suggestion_calls["history"] == ""
+    assert suggestion_calls["question"] == "Original question and missing part"
+    assert "queues" in suggestion_calls["chunks"][0].content.lower()
     assert queries == ["Original question and missing part"]
     assert forbidden_calls == []
     assert prompts
@@ -505,6 +522,7 @@ def test_accept_runs_isolated_web_step_and_persists_separate_answer(
     assert messages[0].used_web_search is True
     assert messages[0].content == "**Web answer [1]."
     assert messages[0].citations[0]["url"] == "https://example.com/reference"
+    assert messages[0].suggested_questions == ["What about queues?"]
     assert "Original question" not in " ".join(str(m.content) for m in messages)
 
     db.refresh(offer)
@@ -524,7 +542,9 @@ def test_accept_runs_isolated_web_step_and_persists_separate_answer(
     )
     assert duplicate.status == "already_consumed"
     assert duplicate.answer == "**Web answer [1]."
+    assert duplicate.suggested_questions == ["What about queues?"]
     assert len(queries) == 1
+    assert len(prompts) == 1
 
 
 @pytest.mark.parametrize(
