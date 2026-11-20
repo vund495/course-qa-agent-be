@@ -25,12 +25,17 @@ from typing import Any
 
 from fastapi import HTTPException, status
 from langchain_core.messages import HumanMessage, SystemMessage
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.config.config import settings
 from app.core.prompt_manager import get_prompt_manager
-from app.models.chat import ChatMessage, ChatSession
+from app.models.chat import ChatMessage, ChatSession, ChatWebConsent
+from app.services.chat_consent_index import (
+    EMPTY_CONSENT_INDEX,
+    ConsentIndex,
+    build_consent_index,
+)
 from app.services.llm import gateway
 
 logger = logging.getLogger(__name__)
@@ -158,23 +163,86 @@ def _validate_session(
     return session
 
 
-def _as_exchanges(messages: Sequence[ChatMessage]) -> list[ConversationExchange]:
-    """Pair USER and ASSISTANT rows in chronological order.
+def _as_exchanges(
+    messages: Sequence[ChatMessage],
+    consents: ConsentIndex = EMPTY_CONSENT_INDEX,
+) -> list[ConversationExchange]:
+    """Resolve one answer per USER row using parent links and consent proof.
 
-    Orphaned messages (for example a failed generation) are ignored so the
-    model never sees half a turn as conversational context.
+    A web answer is used only when a consumed consent row binds it to the course
+    answer that belongs to the same USER turn. Legacy adjacent answers are kept
+    only when they have no parent; orphan answers and unconsumed web answers are
+    ignored so the model never sees half a turn as conversational context.
     """
 
+    ordered = list(messages)
+    children: dict[uuid.UUID, list[ChatMessage]] = {}
+    for message in ordered:
+        if message.parent_message_id:
+            children.setdefault(message.parent_message_id, []).append(message)
+
+    used: set[uuid.UUID] = set()
     exchanges: list[ConversationExchange] = []
-    pending_user: str | None = None
+    for index, user in enumerate(ordered):
+        if user.role != "USER" or user.id in used:
+            continue
 
-    for message in messages:
-        if message.role == "USER":
-            pending_user = message.content
-        elif message.role == "ASSISTANT" and pending_user is not None:
-            exchanges.append(ConversationExchange(user=pending_user, assistant=message.content))
-            pending_user = None
+        course_candidates = [
+            child
+            for child in children.get(user.id, [])
+            if child.role == "ASSISTANT" and not child.used_web_search
+        ]
+        course = course_candidates[0] if course_candidates else None
+        web: ChatMessage | None = None
 
+        if course is not None:
+            for child in children.get(course.id, []):
+                if (
+                    child.role == "ASSISTANT"
+                    and child.used_web_search
+                    and consents.is_consumed(course.id, child.id)
+                ):
+                    web = child
+                    break
+        else:
+            # A direct USER-parent legacy web answer is still valid even when
+            # another USER message was interleaved before it. Adjacency is only
+            # for old rows that carry no parent link at all.
+            direct_legacy_web = next(
+                (
+                    child
+                    for child in children.get(user.id, [])
+                    if child.role == "ASSISTANT"
+                    and child.used_web_search
+                    and not consents.web_has_consent(child.id)
+                ),
+                None,
+            )
+            if direct_legacy_web is not None:
+                web = direct_legacy_web
+            else:
+                following = ordered[index + 1] if index + 1 < len(ordered) else None
+                if (
+                    following is not None
+                    and following.role == "ASSISTANT"
+                    and following.parent_message_id is None
+                ):
+                    if following.used_web_search:
+                        if not consents.web_has_consent(following.id):
+                            web = following
+                    else:
+                        course = following
+
+        chosen = web or course
+        if chosen is None or chosen.id in used:
+            continue
+        used.add(user.id)
+        used.add(chosen.id)
+        if course is not None:
+            used.add(course.id)
+        exchanges.append(
+            ConversationExchange(user=user.content, assistant=chosen.content)
+        )
     return exchanges
 
 
@@ -222,7 +290,7 @@ def load_recent_exchanges(
             ChatMessage.excluded_from_context.is_(False),
         )
         .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
-        .limit(limit * 2 + 2)
+        .limit(limit * 3 + 2)
     ).all()
 
     # Legacy rows may share a timestamp because the pair was inserted in one
@@ -234,7 +302,25 @@ def load_recent_exchanges(
             0 if message.role == "USER" else 1,
         ),
     )
-    exchanges = _as_exchanges(ordered)[-limit:]
+    assistant_ids = [message.id for message in ordered if message.role == "ASSISTANT"]
+    consents = EMPTY_CONSENT_INDEX
+    if assistant_ids:
+        consent_rows = db.execute(
+            select(
+                ChatWebConsent.assistant_message_id,
+                ChatWebConsent.web_message_id,
+                ChatWebConsent.status,
+            ).where(
+                ChatWebConsent.session_id == session_id,
+                ChatWebConsent.user_id == user_id,
+                or_(
+                    ChatWebConsent.assistant_message_id.in_(assistant_ids),
+                    ChatWebConsent.web_message_id.in_(assistant_ids),
+                ),
+            )
+        ).all()
+        consents = build_consent_index(consent_rows)
+    exchanges = _as_exchanges(ordered, consents)[-limit:]
     return _trim_to_budget(exchanges, max_chars=budget)
 
 

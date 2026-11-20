@@ -8,12 +8,14 @@ Covers:
 - QdrantStore.similarity_search_by_vector_with_score
 """
 
+import asyncio
+import threading
 import uuid
 from unittest.mock import MagicMock
 
 from qdrant_client.http import models as qmodels
 
-from app.services import history_service
+from app.services import content_gap_telemetry, history_service
 from app.services.vector_store.qdrant_store import QdrantStore
 
 
@@ -169,3 +171,203 @@ def test_qdrant_store_similarity_search_by_vector_with_score():
     assert qfilter is not None
     assert qfilter.must[0].key == "metadata.class_id"
     assert qfilter.must[0].match.value == "class-xyz"
+
+
+def test_material_capture_does_not_overwrite_consumed_web_source():
+    mock_client = MagicMock()
+    msg_id = str(uuid.uuid4())
+    history_service.sync_content_gap_query(
+        message_id=msg_id,
+        class_id=str(uuid.uuid4()),
+        student_id=str(uuid.uuid4()),
+        embedding=[0.1] * 1536,
+        source="material",
+        concept_tag="",
+        qdrant_client=mock_client,
+        web_consumed=lambda: True,
+    )
+
+    point = mock_client.upsert.call_args.kwargs["points"][0]
+    assert point.payload["source"] == "web"
+    assert point.payload["concept_tag"] == ""
+
+
+class _FakeQdrant:
+    def __init__(self):
+        self.points: dict[str, object] = {}
+        self.payloads: list[dict] = []
+
+    def collection_exists(self, _name):
+        return True
+
+    def create_collection(self, **_kwargs):
+        return None
+
+    def upsert(self, collection_name=None, points=None, **kwargs):
+        for point in points:
+            self.points[str(point.id)] = point
+
+    def delete(self, collection_name=None, points_selector=None, **kwargs):
+        for point_id in points_selector.points:
+            self.points.pop(str(point_id), None)
+
+    def set_payload(self, collection_name=None, payload=None, points=None, **kwargs):
+        self.payloads.append({"payload": payload, "points": points})
+        for point_id in points:
+            point = self.points.get(str(point_id))
+            if point is not None:
+                point.payload.update(payload)
+
+
+def test_delete_waits_for_running_upsert_and_removes_the_late_point():
+    msg_id = str(uuid.uuid4())
+    upsert_started = threading.Event()
+    release_upsert = threading.Event()
+    client = _FakeQdrant()
+
+    def blocking_upsert(collection_name=None, points=None, **kwargs):
+        upsert_started.set()
+        assert release_upsert.wait(timeout=2.0)
+        for point in points:
+            client.points[str(point.id)] = point
+
+    client.upsert = blocking_upsert  # type: ignore[method-assign]
+
+    async def scenario():
+        assert content_gap_telemetry.schedule_capture(
+            history_service.sync_content_gap_query,
+            message_id=msg_id,
+            class_id=str(uuid.uuid4()),
+            student_id=str(uuid.uuid4()),
+            embedding=[0.1] * 4,
+            source="material",
+            qdrant_client=client,
+        )
+        for _ in range(200):
+            if upsert_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert upsert_started.is_set()
+
+        delete_finished = threading.Event()
+
+        def run_delete():
+            history_service.delete_content_gap_queries([msg_id], qdrant_client=client)
+            delete_finished.set()
+
+        delete_thread = threading.Thread(target=run_delete)
+        delete_thread.start()
+        await asyncio.sleep(0.05)
+        assert delete_finished.is_set() is False
+
+        release_upsert.set()
+        await asyncio.to_thread(delete_thread.join, 2.0)
+        await content_gap_telemetry.wait_for_tasks(timeout=2.0)
+
+        assert delete_thread.is_alive() is False
+
+    asyncio.run(scenario())
+
+    assert msg_id not in client.points
+    assert content_gap_telemetry.active_state_count() == 0
+    assert content_gap_telemetry.schedule_capture(
+        history_service.sync_content_gap_query,
+        message_id=msg_id,
+        class_id=str(uuid.uuid4()),
+        student_id=str(uuid.uuid4()),
+        embedding=[0.1] * 4,
+        source="material",
+        qdrant_client=client,
+    ) is False
+    assert msg_id not in client.points
+
+
+def test_telemetry_state_is_removed_after_the_worker_finishes():
+    client = _FakeQdrant()
+    msg_id = str(uuid.uuid4())
+
+    async def scenario():
+        assert content_gap_telemetry.schedule_capture(
+            history_service.sync_content_gap_query,
+            message_id=msg_id,
+            class_id=str(uuid.uuid4()),
+            student_id=str(uuid.uuid4()),
+            embedding=[0.1] * 4,
+            source="material",
+            qdrant_client=client,
+        )
+        await content_gap_telemetry.wait_for_tasks(timeout=2.0)
+
+    asyncio.run(scenario())
+
+    assert msg_id in client.points
+    assert content_gap_telemetry.active_state_count() == 0
+
+
+def test_web_update_keeps_the_same_point_and_final_source_web():
+    client = _FakeQdrant()
+    msg_id = str(uuid.uuid4())
+    upsert_started = threading.Event()
+    release_upsert = threading.Event()
+    update_calls: list[tuple[str, str]] = []
+
+    def blocking_upsert(collection_name=None, points=None, **kwargs):
+        upsert_started.set()
+        assert release_upsert.wait(timeout=2.0)
+        for point in points:
+            client.points[str(point.id)] = point
+
+    client.upsert = blocking_upsert  # type: ignore[method-assign]
+
+    def update_with_fake_client(message_id, source="web", **_kwargs):
+        update_calls.append((str(message_id), source))
+        history_service.update_content_gap_source(
+            message_id,
+            source=source,
+            qdrant_client=client,
+        )
+
+    async def scenario():
+        assert content_gap_telemetry.schedule_capture(
+            history_service.sync_content_gap_query,
+            message_id=msg_id,
+            class_id=str(uuid.uuid4()),
+            student_id=str(uuid.uuid4()),
+            embedding=[0.1] * 4,
+            source="material",
+            qdrant_client=client,
+        )
+        for _ in range(200):
+            if upsert_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert upsert_started.is_set()
+        assert content_gap_telemetry.schedule_web_update(
+            update_with_fake_client,
+            message_id=msg_id,
+        )
+        release_upsert.set()
+        await content_gap_telemetry.wait_for_tasks(timeout=2.0)
+
+    asyncio.run(scenario())
+
+    assert update_calls == [(msg_id, "web")]
+    assert list(client.points) == [msg_id]
+    assert client.points[msg_id].payload["source"] == "web"
+    assert any(
+        entry["points"] == [msg_id] and entry["payload"].get("source") == "web"
+        for entry in client.payloads
+    )
+    assert content_gap_telemetry.active_state_count() == 0
+
+
+def test_deleted_tombstones_are_bounded(monkeypatch):
+    monkeypatch.setattr(content_gap_telemetry, "MAX_DELETED_TOMBSTONES", 2)
+    client = MagicMock()
+    for _ in range(3):
+        history_service.delete_content_gap_queries(
+            [str(uuid.uuid4())],
+            qdrant_client=client,
+        )
+
+    assert content_gap_telemetry.deleted_tombstone_count() <= 2

@@ -87,6 +87,16 @@ def test_settings_uses_confirmed_ai105_defaults():
     assert settings.email_rate_limit_per_minute == 20
 
 
+def test_scope_models_are_separate_and_configurable(monkeypatch):
+    monkeypatch.setenv("DECISION_MODEL", "gemini-decision-1")
+    monkeypatch.setenv("SCOPE_QUERY_MODEL", "models/gemini-3.5-flash-lite")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.decision_model == "gemini-decision-1"
+    assert settings.scope_query_model == "models/gemini-3.5-flash-lite"
+
+
 def test_environment_cannot_override_fixed_ai105_configuration(monkeypatch):
     """Prevent environment variables from changing code-fixed AI-105 settings."""
     monkeypatch.setenv("LLM_MODEL", "models/another-model")

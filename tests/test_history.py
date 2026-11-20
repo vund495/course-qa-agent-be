@@ -11,6 +11,7 @@ Covers AC-01 through AC-07:
 import uuid
 from collections.abc import Generator
 from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -257,9 +258,11 @@ def test_delete_session_cascades(client: TestClient, db_session: Session) -> Non
 
 
 def test_delete_session_does_not_affect_other_sessions(
-    client: TestClient, db_session: Session
+    client: TestClient, db_session: Session, monkeypatch
 ) -> None:
     """AC-01: Deleting one session leaves other sessions and their messages intact."""
+    qdrant = MagicMock()
+    monkeypatch.setattr(history_service, "get_qdrant_client", lambda: qdrant)
     headers = _login(client, "student@academic.edu.vn", "Student@123")
     class_id = str(_get_test_class_id(db_session))
 
@@ -290,6 +293,7 @@ def test_delete_session_does_not_affect_other_sessions(
 
     delete_res = client.delete(f"/api/history/{session_1_id}", headers=headers)
     assert delete_res.status_code == 200
+    assert qdrant.delete.called
 
     deleted_detail = client.get(f"/api/history/{session_1_id}", headers=headers)
     assert deleted_detail.status_code == 404

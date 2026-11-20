@@ -4,22 +4,18 @@ class-scope-prompt:
     Class subject: "{class_name}"
     Syllabus summary: "{class_description}"
 
-    Classify the student's question into exactly ONE of the following 5 verdicts:
+    Classify the student's question into exactly ONE of these 5 verdicts:
     1. core: Direct lecture theory, course syntax, textbook concepts, algorithms, code explanations, or standard technical questions taught in this subject (e.g. pointers, OOP, data structures, recursion).
-    2. comparison: Comparative questions contrasting this course's subject with another language or tool (e.g. comparing C++ with Python, or Java with Go).
+    2. comparison: Comparative questions contrasting this course's subject with another language or tool (e.g. C++ with Python, or Java with Go).
     3. extension: In-scope practical tools, build systems (CMake, Make, GCC), debuggers (GDB, Valgrind), modern language standards, or real-world runtime bugs belonging to this course's subject, even if not fully covered in slides.
-    4. logistics: Course administration and syllabus structure: course syllabus, roadmap, outline, units, sessions, schedule, assignment deadlines, exam dates/formats, grading criteria, attendance policy, or instructor contact. (These are answered strictly from course documents and database roadmap; never use web search).
-    5. out_of_scope: Entirely outside this course's domain (e.g., pure foreign tech without comparison like asking Python decorators in a C++ class, or non-academic topics like cooking/weather).
+    4. logistics: Course administration and syllabus structure: syllabus, roadmap, outline, units, sessions, schedule, assignment deadlines, exam dates/formats, grading criteria, attendance policy, or instructor contact. These are answered strictly from course documents and database roadmap.
+    5. out_of_scope: Entirely outside this course's domain (e.g. pure foreign tech without comparison, such as Python decorators in a C++ class, or non-academic topics like cooking/weather).
 
-    Additional fields to populate:
-    - reasoning: Briefly explain your reasoning in 1 sentence before setting the verdict.
-    - is_related_tech: Only when verdict is out_of_scope. True if it asks about another programming language/tech, False if it is a general non-tech topic.
-    - is_homework_request: True if the student explicitly asks to solve their homework/assignment/exam to copy code.
-    - external_search_query: A concise 2-4 word search engine query leading with the primary technical subject (e.g. "quicksort pivot algorithm", "C++ Fibonacci recursion", "C++ smart pointers"). NEVER output long diluted phrases or conversational sentences.
-    - search_query_en: A concise English 2-4 word technical keyword query leading with the subject noun (e.g. "quicksort pivot algorithm", "C++ Fibonacci recursion"). Keep it short and specific to avoid query dilution.
-    - confidence: Confidence score between 0.0 and 1.0.
+    Also decide:
+    - is_related_tech: True when an out-of-scope request is about another programming language or technology; false for general non-technical topics.
+    - is_homework_request: True only when the student explicitly asks for a solution to homework, an assignment, or an exam that they can copy.
 
-    Return only valid JSON matching the ScopeDecision schema.
+    Consider the entire supplied context when classifying: the current question, recent conversation, course name and description, retrieved slide context, and any code snippet. Return typed answers named verdict (choice), is_related_tech (noul), and is_homework_request (noul). Do not generate search queries or explanatory reasoning.
 
   user-prompt: |
     Class: {class_name}
@@ -33,4 +29,10 @@ class-scope-prompt:
     ---------------------
     Question: {question}
 
-    ScopeDecision JSON:
+scope-query-prompt:
+  system-prompt: |
+    Generate two concise search queries based on the student question and supplied course context.
+    external_search_query: A 2-4 word web search query starting with the primary technical subject.
+    search_query_en: A 2-4 word English technical keyword query starting with the subject noun.
+    Use short and specific keywords, e.g. "quicksort pivot algorithm", "C++ Fibonacci recursion", or "C++ smart pointers".
+    Return only a JSON object with external_search_query and search_query_en. Use null when no useful query can be generated.

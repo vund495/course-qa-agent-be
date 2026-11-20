@@ -1897,3 +1897,71 @@ def test_teaching_assistant_works_on_the_classes_tickets(client, db_session, inb
     )
     assert client.get(f"/api/tickets/{foreign.id}", headers=headers).status_code == 403
     assert client.post(f"/api/tickets/{foreign.id}/resolve", headers=headers).status_code == 403
+
+def test_student_web_answer_keeps_teacher_ticket_and_reload_links(client, db_session):
+    from app.models.chat import ChatMessage
+    from app.services.history_service import save_chat_turn
+
+    session, _, course_answer = save_chat_turn(
+        db_session,
+        db_session.info["student_id"],
+        db_session.info["class_id"],
+        "Original question",
+        "Course answer",
+    )
+    web_answer = ChatMessage(
+        session_id=session.id,
+        role="ASSISTANT",
+        content="Web answer",
+        used_web_search=True,
+        parent_message_id=course_answer.id,
+        citations=[
+            {
+                "index": 1,
+                "kind": "internet",
+                "title": "Source",
+                "url": "https://example.com",
+                "snippet": "Evidence",
+            }
+        ],
+    )
+    db_session.add(web_answer)
+    db_session.commit()
+    db_session.refresh(web_answer)
+
+    headers = _headers(db_session.info["student_id"])
+    feedback_url = f"/api/chat/messages/{web_answer.id}/feedback"
+    ticket_url = f"/api/chat/messages/{web_answer.id}/ticket"
+
+    assert (
+        client.put(feedback_url, headers=headers, json={"feedback": "helpful"}).status_code
+        == 200
+    )
+    assert client.post(ticket_url, headers=headers, json={"confirmed": True}).status_code == 409
+    assert (
+        client.put(
+            feedback_url, headers=headers, json={"feedback": "not_helpful"}
+        ).status_code
+        == 200
+    )
+
+    created = client.post(
+        ticket_url, headers=headers, json={"confirmed": True, "details": "Please explain"}
+    )
+    assert created.status_code == 201
+    assert created.json()["original_question"] == "Original question"
+    assert created.json()["source_message_id"] == str(web_answer.id)
+
+    db_session.expire_all()
+    reloaded = client.get(f"/api/history/{session.id}", headers=headers).json()
+    item = next(message for message in reloaded["messages"] if message["id"] == str(web_answer.id))
+    assert item["feedback"] == "not_helpful"
+    assert item["original_question"] == "Original question"
+    assert item["can_create_feedback_ticket"] is True
+    assert item["ticket_id"] == created.json()["id"]
+
+    trainer_headers = _headers(db_session.info["trainer_id"], "trainer")
+    assert (
+        client.post(ticket_url, headers=trainer_headers, json={"confirmed": True}).status_code
+        == 403
+    )

@@ -17,6 +17,7 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import asdict
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
@@ -26,20 +27,28 @@ from app.schemas.history import ChatCitation
 from app.services import (
     chat_context_service,
     chat_retrieval_service,
+    content_gap_telemetry,
     course_service,
     decision_service,
+    document_answer_service,
     document_service,
     history_service,
+    quick_response_service,
     rag_service,
     strict_sources_service,
     strict_web_service,
+    suggestion_service,
     web_consent_service,
 )
 from app.services.chat_context_service import ConversationExchange
 from app.services.chat_service import (
     _HOMEWORK_PATTERNS,
     GENERATION_ERROR_MESSAGE,
+    SUGGESTION_PREFETCH_GRACE_SECONDS,
     TIMEOUT_ERROR_MESSAGE,
+    _format_syllabus_roadmap,
+    _is_syllabus_relevant_question,
+    _tag_pedagogy,
 )
 from app.services.llm import gateway
 
@@ -89,7 +98,11 @@ def _persist_turn(
     answer: str,
     citations: Sequence[dict[str, Any]],
     trace: Sequence[str],
+    suggested_questions: Sequence[str] | None = None,
     excluded_from_context: bool = False,
+    thinking_ms: int | None = None,
+    query_embedding: Sequence[float] | None = None,
+    fallback_reason: str | None = None,
 ) -> tuple[Any, Any, Any] | None:
     if user_id is None or not answer.strip():
         return None
@@ -103,12 +116,71 @@ def _persist_turn(
             session_id=session_id,
             used_web_search=False,
             citations=citations,
+            suggested_questions=suggested_questions,
             trace=trace,
             excluded_from_context=excluded_from_context,
+            thinking_ms=thinking_ms,
+            query_embedding=list(query_embedding) if query_embedding else None,
+            fallback_reason=fallback_reason,
+            sync_content_gap=False,
         )
     except Exception:
         logger.exception("Failed to persist strict-source chat turn.")
         return None
+
+
+def _schedule_content_gap_sync(
+    *,
+    message_id: str,
+    class_id: str,
+    student_id: str,
+    embedding: Sequence[float] | None,
+    fallback_reason: str | None,
+) -> None:
+    if not embedding:
+        return
+    content_gap_telemetry.schedule_capture(
+        history_service.sync_content_gap_query,
+        message_id=message_id,
+        class_id=class_id,
+        student_id=student_id,
+        embedding=list(embedding),
+        source="material",
+        fallback_reason=fallback_reason,
+        embedding_model_version=settings.embedding_model,
+    )
+
+
+def _schedule_content_gap_source_update(message_id: str) -> None:
+    content_gap_telemetry.schedule_web_update(
+        history_service.update_content_gap_source,
+        message_id=message_id,
+    )
+
+
+async def wait_for_content_gap_tasks(timeout: float = 2.0) -> None:
+    """Await in-flight best-effort telemetry (tests and graceful shutdown)."""
+
+    await content_gap_telemetry.wait_for_tasks(timeout)
+
+
+def _fallback_reason(
+    result: strict_sources_service.StrictSourcesResult,
+    decision: rag_service.RetrievalDecision,
+) -> str | None:
+    """Describe why the course lane needed the consent fallback.
+
+    This is telemetry only: it reuses the retrieval decision and never changes
+    a threshold, gate or the full/partial/none status.
+    """
+
+    if result.status == "full":
+        return None
+    if not decision.chunks:
+        return "no_results"
+    if decision.top_score is not None and decision.top_score < decision.threshold:
+        return "similarity_below_threshold"
+    return "insufficient_context"
 
 
 def _source_citations(
@@ -121,6 +193,31 @@ def _source_citations(
         for citation in rag_service.curriculum_citations(chunks)
         if str(citation.index) in used
     ]
+
+
+def _web_source_links(sources: Sequence[rag_service.Source]) -> list[rag_service.Source]:
+    """Every valid search-result URL, independent of model citation markers.
+
+    The web answer may omit ``[n]`` markers; the Web Sources panel and the
+    persisted citations must still point at the URLs fetched during consent.
+    """
+
+    links: list[rag_service.Source] = []
+    seen: set[str] = set()
+    for source in sources:
+        url = (source.url or "").strip()
+        try:
+            parsed = urlparse(url)
+            _ = parsed.port  # force validation of a malformed port
+        except ValueError:
+            continue
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        links.append(source)
+    return links
 
 
 def _conflict_intents(result: strict_sources_service.StrictSourcesResult):
@@ -180,10 +277,60 @@ async def stream_chat(
     is_hw = bool(_HOMEWORK_PATTERNS.search(message))
 
     try:
+        if user_id is not None and session_id is not None:
+            web_consent_service.expire_pending_offers(
+                db,
+                user_id=user_id,
+                session_id=session_id,
+            )
+
+        quick_answer = quick_response_service.get_quick_response(message)
+        if quick_answer:
+            for part in quick_response_service.split_into_stream_chunks(quick_answer):
+                yield _sse("token", {"text": part})
+            trace.append(f"pedagogy:{_tag_pedagogy(message)}")
+            saved = _persist_turn(
+                db,
+                user_id=user_id,
+                session_id=session_id,
+                class_id=class_id,
+                message=message,
+                answer=quick_answer,
+                citations=[],
+                trace=trace,
+                thinking_ms=0,
+                # A fixed greeting/thanks reply is not evidence for the course
+                # lane and must not become a Content Gap material answer.
+                excluded_from_context=True,
+            )
+            saved_session, user_msg, assistant_msg = saved or (None, None, None)
+            yield _sse(
+                "done",
+                {
+                    "source": "conversation",
+                    "used_web_search": False,
+                    "threshold": 0.0,
+                    "top_score": None,
+                    "session_id": (
+                        str(saved_session.id)
+                        if saved_session is not None
+                        else (str(session_id) if session_id is not None else None)
+                    ),
+                    "user_message_id": str(user_msg.id) if user_msg is not None else None,
+                    "assistant_message_id": (
+                        str(assistant_msg.id) if assistant_msg is not None else None
+                    ),
+                    "suggestions": [],
+                    "suggested_questions": [],
+                },
+            )
+            return
+
         if not document_service.class_has_uploaded_documents(db, class_id):
             text = NO_CLASS_DOCUMENTS_MESSAGE
             yield _sse("token", {"text": text})
             trace.append("Class materials: none uploaded")
+            trace.append(f"pedagogy:{_tag_pedagogy(message)}")
             saved = _persist_turn(
                 db,
                 user_id=user_id,
@@ -194,6 +341,7 @@ async def stream_chat(
                 citations=[],
                 trace=trace,
                 excluded_from_context=True,
+                thinking_ms=int((time.monotonic() - started) * 1000),
             )
             saved_session, user_msg, assistant_msg = saved or (None, None, None)
             yield _sse(
@@ -212,12 +360,6 @@ async def stream_chat(
             )
             return
 
-        if user_id is not None and session_id is not None:
-            web_consent_service.expire_pending_offers(
-                db,
-                user_id=user_id,
-                session_id=session_id,
-            )
         async with asyncio.timeout(budget):
             yield _sse("progress", {"stage": "searching", "message": "Checking class scope"})
             class_record = course_service.get_class(db, class_id)
@@ -242,6 +384,7 @@ async def stream_chat(
                 )
                 yield _sse("token", {"text": text})
                 trace.append("Scope gate: out of scope")
+                trace.append(f"pedagogy:{_tag_pedagogy(message)}")
                 saved = _persist_turn(
                     db,
                     user_id=user_id,
@@ -252,6 +395,7 @@ async def stream_chat(
                     citations=[],
                     trace=trace,
                     excluded_from_context=True,
+                    thinking_ms=int((time.monotonic() - started) * 1000),
                 )
                 saved_session, user_msg, assistant_msg = saved or (None, None, None)
                 yield _sse(
@@ -296,6 +440,29 @@ async def stream_chat(
             trace.append(
                 f"Retrieved {len(chunks)} class sections (score={decision.top_score})"
             )
+            filtered = await decision_service.filter_reranked_chunks(
+                question=standalone,
+                chunks=chunks,
+                db=db,
+            )
+            if len(filtered) != len(chunks):
+                trace.append(f"Decision rerank gate kept {len(filtered)} of {len(chunks)} course sections")
+            chunks = filtered
+
+            # A published syllabus roadmap is an authoritative class source.
+            # It still goes through the same scope gate and strict evidence
+            # validator; it is never treated as web or unvalidated context.
+            if _is_syllabus_relevant_question(standalone):
+                _roadmap_text, roadmap_chunk = _format_syllabus_roadmap(db, class_id)
+                if roadmap_chunk is not None:
+                    visible_document_ids = document_service.retrievable_document_ids(
+                        db, class_id
+                    )
+                    if roadmap_chunk.document_id in visible_document_ids:
+                        # Add the published roadmap; never remove valid retrieved
+                        # chunks that happen to share its document ID.
+                        chunks = [roadmap_chunk, *chunks]
+                        trace.append("Included published syllabus roadmap")
             yield _sse(
                 "progress",
                 {
@@ -320,8 +487,48 @@ async def stream_chat(
 
             conflict_warning = _conflict_warning(result)
             conflict_ids = _conflict_source_ids(result)
+            composed_answer = ""
+            supported_intents = [
+                intent for intent in result.intents if intent.status == "supported"
+            ]
+            composer_sources = sorted(
+                {
+                    str(source_id)
+                    for intent in supported_intents
+                    for source_id in intent.source_ids
+                }
+            )
+            composer_question = standalone
+            if result.status == "partial":
+                composer_question = " ".join(
+                    intent.question_segment.strip() for intent in supported_intents
+                ).strip()
+            if (
+                result.status in ("full", "partial")
+                and supported_intents
+                and composer_sources
+                and not is_hw
+                and budget - (time.monotonic() - started) > 3.0
+            ):
+                composer_budget = min(
+                    document_answer_service.DOCUMENT_ANSWER_TIMEOUT_SECONDS,
+                    max(0.1, budget - (time.monotonic() - started) - 2.0),
+                )
+                try:
+                    composed_answer = await document_answer_service.compose_document_answer(
+                        db,
+                        question=composer_question,
+                        chunks=chunks,
+                        source_ids=composer_sources,
+                        timeout_seconds=composer_budget,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Document answer composition failed; using the validated draft.",
+                        exc_info=True,
+                    )
             if result.status == "full":
-                answer = (result.answer or "").strip()
+                answer = composed_answer or (result.answer or "").strip()
                 if not answer:
                     yield _sse("error", {"message": STRICT_GENERATION_ERROR_MESSAGE})
                     return
@@ -329,7 +536,7 @@ async def stream_chat(
                 kind = "full"
                 source = rag_service.SOURCE_CURRICULUM
             elif result.status == "partial":
-                answer = (result.answer or "").strip()
+                answer = composed_answer or (result.answer or "").strip()
                 if not answer:
                     yield _sse("error", {"message": STRICT_GENERATION_ERROR_MESSAGE})
                     return
@@ -350,11 +557,45 @@ async def stream_chat(
                 source = "none"
 
             yield _sse("progress", {"stage": "drafting", "message": "Drafting validated answer"})
+            first_token_ms = int((time.monotonic() - started) * 1000)
             for part in _answer_chunks(answer):
                 yield _sse("token", {"text": part})
             for citation in citations:
                 yield _sse("citation", _citation_dict(citation))
 
+            followup_questions: list[str] = []
+            remaining = budget - (time.monotonic() - started)
+            if kind in ("full", "partial") and remaining > 1.0:
+                try:
+                    followup_questions = await asyncio.wait_for(
+                        suggestion_service.generate_followup_questions(
+                            question=standalone,
+                            answer=answer,
+                            chunks=chunks,
+                            history=chat_context_service.format_history_context(context_history),
+                            model=None,
+                            db=db,
+                        ),
+                        timeout=min(
+                            SUGGESTION_PREFETCH_GRACE_SECONDS,
+                            max(0.1, remaining - 1.0),
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Suggestion prefetch failed; using fallback suggestions.",
+                        exc_info=True,
+                    )
+                    followup_questions = []
+                if not followup_questions:
+                    followup_questions = suggestion_service.build_fallback_followups(
+                        question=message,
+                        class_name=class_name,
+                        chunks=chunks,
+                    )
+
+            trace.append(f"pedagogy:{_tag_pedagogy(message)}")
+            fallback_reason = _fallback_reason(result, decision)
             saved = _persist_turn(
                 db,
                 user_id=user_id,
@@ -363,10 +604,30 @@ async def stream_chat(
                 message=message,
                 answer=answer,
                 citations=[_citation_dict(citation) for citation in citations],
+                suggested_questions=followup_questions or None,
                 trace=trace,
+                thinking_ms=first_token_ms,
+                query_embedding=list(decision.query_vector) if decision.query_vector else None,
+                fallback_reason=fallback_reason,
             )
             saved_session, user_msg, assistant_msg = saved or (None, None, None)
             resolved_session_id = saved_session.id if saved_session else session_id
+
+            if assistant_msg is not None and user_id is not None:
+                try:
+                    _schedule_content_gap_sync(
+                        message_id=str(assistant_msg.id),
+                        class_id=str(class_id),
+                        student_id=str(user_id),
+                        embedding=decision.query_vector or None,
+                        fallback_reason=fallback_reason,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not schedule content-gap telemetry for message %s.",
+                        assistant_msg.id,
+                        exc_info=True,
+                    )
 
             offer = None
             if (
@@ -391,6 +652,9 @@ async def stream_chat(
                 if offer is not None:
                     yield _sse("consent", web_consent_service.offer_read(offer).model_dump(mode="json"))
 
+            if followup_questions:
+                yield _sse("suggestions", {"questions": followup_questions})
+
             yield _sse(
                 "done",
                 _done_payload(
@@ -404,6 +668,7 @@ async def stream_chat(
                     answer_kind="course",
                     is_homework=is_hw,
                     consent_offer_id=offer.id if offer is not None else None,
+                    suggested_questions=followup_questions,
                 ),
             )
     except TimeoutError:
@@ -482,6 +747,7 @@ async def stream_web_consent(
         if timeout_seconds is not None
         else settings.chat_timeout_seconds
     )
+    started = time.monotonic()
     completed = False
     released = False
 
@@ -532,6 +798,7 @@ async def stream_web_consent(
                 HumanMessage(content=user_prompt),
             ]
             answer_parts: list[str] = []
+            first_token_ms: int | None = None
             async for part in gateway.astream_chat(
                 db,
                 messages,
@@ -541,6 +808,8 @@ async def stream_web_consent(
                     answer_parts.clear()
                     yield _sse("restart", {"message": part.message})
                 elif part:
+                    if first_token_ms is None:
+                        first_token_ms = int((time.monotonic() - started) * 1000)
                     answer_parts.append(part)
                     yield _sse("token", {"text": part})
 
@@ -551,7 +820,49 @@ async def stream_web_consent(
                 )
                 raise strict_web_service.WebEvidenceError("Web answer was empty.")
 
-            citations = rag_service.cited_web_citations(sources, answer)
+            citations = _web_source_links(sources)
+            web_suggestion_chunks = [
+                rag_service.ScoredChunk(
+                    content=result.content,
+                    score=1.0,
+                    metadata={"title": result.title, "url": result.url},
+                )
+                for result in results
+                if getattr(result, "content", "")
+            ]
+            followup_questions: list[str] = []
+            remaining = budget - (time.monotonic() - started)
+            if web_suggestion_chunks and remaining > 1.0:
+                try:
+                    followup_questions = await asyncio.wait_for(
+                        suggestion_service.generate_followup_questions(
+                            question=offer.query_text,
+                            answer=answer,
+                            chunks=web_suggestion_chunks,
+                            history="",
+                            model=None,
+                            db=db,
+                        ),
+                        timeout=min(
+                            SUGGESTION_PREFETCH_GRACE_SECONDS,
+                            max(0.1, remaining - 1.0),
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Web suggestion prefetch failed; using fallback suggestions.",
+                        exc_info=True,
+                    )
+                    followup_questions = []
+                if not followup_questions:
+                    followup_questions = suggestion_service.build_fallback_followups(
+                        question=offer.query_text,
+                        class_name="",
+                        chunks=web_suggestion_chunks,
+                    )
+            pedagogy_source = getattr(offer, "question", None) or getattr(
+                offer, "query_text", ""
+            )
             message = history_service.append_message(
                 db,
                 session_id=offer.session_id,
@@ -559,6 +870,9 @@ async def stream_web_consent(
                 content=answer,
                 used_web_search=True,
                 citations=[_citation_dict(citation) for citation in citations],
+                suggested_questions=followup_questions or None,
+                thinking_ms=first_token_ms,
+                trace=[f"pedagogy:{_tag_pedagogy(pedagogy_source)}"],
             )
             message.parent_message_id = offer.assistant_message_id
             db.commit()
@@ -567,8 +881,23 @@ async def stream_web_consent(
             )
             completed = True
 
+            # Reuse the course turn's existing point instead of storing a
+            # second vector. The in-process flag is set synchronously so a
+            # slow material upsert cannot overwrite the consumed-web source;
+            # the Qdrant call itself stays off the response path.
+            if offer.assistant_message_id is not None:
+                try:
+                    _schedule_content_gap_source_update(str(offer.assistant_message_id))
+                except Exception:
+                    logger.warning(
+                        "Could not schedule content-gap web update for message %s.",
+                        offer.assistant_message_id,
+                        exc_info=True,
+                    )
             for citation in citations:
                 yield _sse("citation", _citation_dict(citation))
+            if followup_questions:
+                yield _sse("suggestions", {"questions": followup_questions})
             yield _sse(
                 "done",
                 {
@@ -579,8 +908,8 @@ async def stream_web_consent(
                     "session_id": str(offer.session_id),
                     "user_message_id": None,
                     "assistant_message_id": str(message.id),
-                    "suggestions": [],
-                    "suggested_questions": [],
+                    "suggestions": followup_questions,
+                    "suggested_questions": followup_questions,
                     "strict_status": "web",
                     "answer_kind": "web",
                     "is_homework": False,
@@ -626,6 +955,7 @@ def _consumed_result(db: Session, offer: Any) -> WebConsentResult:
         citations=[
             ChatCitation.model_validate(citation) for citation in (message.citations or [])
         ],
+        suggested_questions=list(message.suggested_questions or []),
         assistant_message_id=message.id,
     )
 
@@ -642,6 +972,7 @@ def _done_payload(
     answer_kind: str,
     is_homework: bool,
     consent_offer_id: uuid.UUID | None = None,
+    suggested_questions: Sequence[str] = (),
 ) -> dict[str, Any]:
     return {
         "source": source,
@@ -653,8 +984,8 @@ def _done_payload(
         "assistant_message_id": (
             str(assistant_message_id) if assistant_message_id is not None else None
         ),
-        "suggestions": [],
-        "suggested_questions": [],
+        "suggestions": list(suggested_questions),
+        "suggested_questions": list(suggested_questions),
         "strict_status": strict_status,
         "answer_kind": answer_kind,
         "is_homework": is_homework,

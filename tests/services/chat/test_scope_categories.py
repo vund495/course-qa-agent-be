@@ -17,24 +17,22 @@ from app.services import decision_service
 from app.services.decision_service import ScopeDecision, is_confidently_out_of_scope
 
 
-@pytest.fixture(autouse=True)
-def _clear_cooldown():
-    decision_service.reset_failure_state()
-    yield
-    decision_service.reset_failure_state()
-
-
 def _mock_gemini(monkeypatch, verdict: str, confidence: float):
-    class FakeModels:
-        async def generate_content(self, **kwargs):
+    class FakeDecisions:
+        async def create(self, **kwargs):
             return SimpleNamespace(
-                parsed=ScopeDecision(verdict=verdict, confidence=confidence),
-                text=None,
+                answers={
+                    "verdict": SimpleNamespace(
+                        type="choice", choice=verdict, confidence=confidence
+                    ),
+                    "is_related_tech": SimpleNamespace(type="noul", noul=0.8),
+                    "is_homework_request": SimpleNamespace(type="noul", noul=0.2),
+                }
             )
 
     class FakeAio:
         def __init__(self):
-            self.models = FakeModels()
+            self.decisions = FakeDecisions()
             self.closed = False
 
         async def aclose(self):
@@ -47,6 +45,10 @@ def _mock_gemini(monkeypatch, verdict: str, confidence: float):
     monkeypatch.setattr(decision_service.genai, "Client", FakeClient)
     monkeypatch.setattr(decision_service.settings, "decision_provider", "gemini")
     monkeypatch.setattr(decision_service.settings, "google_api_key", SecretStr("secret-key"))
+    async def empty_queries(*args, **kwargs):
+        return "{}"
+
+    monkeypatch.setattr(decision_service.gateway, "ainvoke_chat", empty_queries)
     monkeypatch.setattr(decision_service.settings, "decision_confidence_threshold", 0.8)
 
 
@@ -65,7 +67,7 @@ def _mock_gemini(monkeypatch, verdict: str, confidence: float):
 )
 def test_category_1_core_curriculum_passes_gate(monkeypatch, question: str):
     """Core curriculum topics must be classified as in_scope and pass the gate."""
-    _mock_gemini(monkeypatch, verdict="in_scope", confidence=1.0)
+    _mock_gemini(monkeypatch, verdict="core", confidence=1.0)
 
     blocked = asyncio.run(
         is_confidently_out_of_scope(
@@ -93,7 +95,7 @@ def test_category_1_core_curriculum_passes_gate(monkeypatch, question: str):
 )
 def test_category_2_comparative_and_tooling_passes_gate(monkeypatch, question: str):
     """Comparative questions and practical build/debug tooling are in_scope."""
-    _mock_gemini(monkeypatch, verdict="in_scope", confidence=0.98)
+    _mock_gemini(monkeypatch, verdict="core", confidence=0.98)
 
     blocked = asyncio.run(
         is_confidently_out_of_scope(

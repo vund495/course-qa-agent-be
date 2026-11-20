@@ -35,9 +35,8 @@ class Settings(BaseSettings):
         vlm_temperature: Temperature setting for VLM responses.
         google_api_key: Secret API key for Google Gemini model access.
         decision_provider: Provider used for the class scope verdict (gemini).
-        decision_model: Model used for class scope verdicts.
-        decision_fallback_model: Model tried once when the primary decision model fails.
-        decision_cooldown_seconds: How long a failing primary decision model is skipped.
+        decision_model: Decisions API model for class scope and optional rerank gating.
+        scope_query_model: Generative model used to create English retrieval and web queries.
         decision_key_attempts: How many admin-managed keys one decision attempt may try.
         decision_confidence_threshold: Minimum confidence before a scope verdict blocks a turn.
         jwt_secret: HS256 signing key for DB-backed login tokens (dev default, override in prod).
@@ -119,14 +118,18 @@ class Settings(BaseSettings):
         validation_alias="GEMINI_KEY_ENCRYPTION_KEY",
     )
     tavily_api_key: str | None = Field(default=None, validation_alias="TAVILY_API_KEY")
-    # Scope verdicts use Gemini through the Google GenAI SDK.
+    # Scope verdicts and query expansion use separate Gemini models.
     decision_provider: Literal["gemini"] = Field(
         default="gemini",
         validation_alias="DECISION_PROVIDER",
     )
     decision_model: str = Field(
-        default="models/gemini-3.5-flash-lite",
+        default="gemini-decision-1",
         validation_alias="DECISION_MODEL",
+    )
+    scope_query_model: str = Field(
+        default="models/gemini-3.5-flash-lite",
+        validation_alias="SCOPE_QUERY_MODEL",
     )
     decision_confidence_threshold: float = Field(
         default=0.8,
@@ -140,49 +143,22 @@ class Settings(BaseSettings):
         le=60.0,
         validation_alias="DECISION_TIMEOUT_SECONDS",
     )
-    # A transient Gemini 503/504 used to make the gate fail open for the whole
-    # turn. A different lite model is tried within the same gate budget, and the
-    # failing primary model is skipped for a short cooldown so later turns do
-    # not pay the same timeout again.
-    decision_fallback_enabled: bool = Field(
-        default=True,
-        validation_alias="DECISION_FALLBACK_ENABLED",
-    )
-    decision_fallback_model: str = Field(
-        default="models/gemini-flash-lite-latest",
-        validation_alias="DECISION_FALLBACK_MODEL",
-    )
-    decision_fallback_timeout_seconds: float = Field(
-        default=6.0,
-        ge=1.0,
-        le=60.0,
-        validation_alias="DECISION_FALLBACK_TIMEOUT_SECONDS",
-    )
-    decision_cooldown_seconds: float = Field(
-        default=60.0,
-        ge=0.0,
-        le=600.0,
-        validation_alias="DECISION_COOLDOWN_SECONDS",
-    )
-    # How many admin-managed keys one attempt may try before the gate falls back
-    # to the fallback model (or fails open). 1 disables key rotation.
+    # How many admin-managed keys one scope request may try before failing open.
     decision_key_attempts: int = Field(
         default=3,
         ge=1,
         le=10,
         validation_alias="DECISION_KEY_ATTEMPTS",
     )
-    decision_connect_timeout_seconds: float = Field(
-        default=3.0,
-        ge=1.0,
-        le=30.0,
-        validation_alias="DECISION_CONNECT_TIMEOUT_SECONDS",
+    rerank_decision_enabled: bool = Field(default=False, validation_alias="RERANK_DECISION_ENABLED")
+    rerank_decision_top_k: int = Field(
+        default=3, ge=1, le=10, validation_alias="RERANK_DECISION_TOP_K"
     )
-    decision_max_output_tokens: int = Field(
-        default=200,
-        ge=16,
-        le=2000,
-        validation_alias="DECISION_MAX_OUTPUT_TOKENS",
+    rerank_decision_reject_threshold: float = Field(
+        default=0.10, ge=0.0, le=0.5, validation_alias="RERANK_DECISION_REJECT_THRESHOLD"
+    )
+    rerank_decision_timeout_seconds: float = Field(
+        default=2.0, gt=0.0, le=10.0, validation_alias="RERANK_DECISION_TIMEOUT_SECONDS"
     )
     serpapi_api_key: str | None = Field(default=None, validation_alias="SERPAPI_API_KEY")
     serpapi_timeout_seconds: float = Field(

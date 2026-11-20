@@ -10,11 +10,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.models.category import ClassCategory
-from app.models.chat import ChatMessage, ChatSession
+from app.models.chat import ChatMessage, ChatSession, ChatWebConsent
 from app.models.course import Class, Enrollment
 from app.schemas.content_gap import (
     ContentGapDashboardResponse,
@@ -25,6 +25,7 @@ from app.schemas.content_gap import (
     QuestionPattern,
     StudentWeaknessProfile,
 )
+from app.services.chat_consent_index import ConsentIndex, build_consent_index
 from app.services.llm.provider import get_llm_model
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,136 @@ logger = logging.getLogger(__name__)
 # In-memory cache for dashboard responses: class_id -> (cached_at, response)
 _DASHBOARD_CACHE: dict[uuid.UUID, tuple[datetime, ContentGapDashboardResponse]] = {}
 CACHE_TTL_SECONDS = 1800  # 30 minutes
+
+# Strict-chat refusal text; the dashboard must not count it as a material answer.
+_NO_EVIDENCE_PREFIX = "I could not find enough evidence in this class's materials"
+
+
+def _message_time(message: ChatMessage) -> float:
+    value = message.created_at
+    if value is None:
+        return 0.0
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.timestamp()
+
+
+def _pedagogy_from_trace(message: ChatMessage | None) -> str | None:
+    if message is None:
+        return None
+    for item in message.trace or []:
+        if isinstance(item, str) and item.startswith("pedagogy:"):
+            return item.split(":", 1)[1]
+    return None
+
+
+def _is_refusal(message: ChatMessage | None) -> bool:
+    """True only when server metadata identifies a refused/no-evidence turn."""
+
+    if message is None:
+        return False
+    if getattr(message, "excluded_from_context", False):
+        return True
+    trace = message.trace or []
+    if any(
+        isinstance(item, str)
+        and item.startswith(
+            ("Scope gate: out of scope", "Class materials: none uploaded")
+        )
+        for item in trace
+    ):
+        return True
+    return (message.content or "").strip().startswith(_NO_EVIDENCE_PREFIX)
+
+
+def _content_gap_turns(
+    messages: list[ChatMessage],
+    consents: ConsentIndex,
+    *,
+    owner_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    """Group answers by their original USER prompt, never by raw adjacency."""
+
+    ordered = list(messages)
+    children: dict[uuid.UUID, list[ChatMessage]] = {}
+    for item in ordered:
+        if item.parent_message_id:
+            children.setdefault(item.parent_message_id, []).append(item)
+
+    used: set[uuid.UUID] = set()
+    turns: list[dict[str, Any]] = []
+    for index, user in enumerate(ordered):
+        if user.role != "USER" or user.id in used:
+            continue
+
+        course_candidates = [
+            child
+            for child in children.get(user.id, [])
+            if child.role == "ASSISTANT" and not child.used_web_search
+        ]
+        course = min(course_candidates, key=_message_time) if course_candidates else None
+        web: ChatMessage | None = None
+
+        if course is not None:
+            # Strict branch: the web answer must be a child of this course
+            # answer and a consumed consent must carry both exact IDs.
+            web_candidates = [
+                child
+                for child in children.get(course.id, [])
+                if child.role == "ASSISTANT"
+                and child.used_web_search
+                and consents.is_consumed(course.id, child.id)
+            ]
+            web = min(web_candidates, key=_message_time) if web_candidates else None
+        else:
+            # A direct USER-parent legacy web answer is still valid even when
+            # another USER message was interleaved before it. Adjacency is only
+            # for old rows that carry no parent link at all.
+            direct_legacy_web_candidates = [
+                child
+                for child in children.get(user.id, [])
+                if child.role == "ASSISTANT"
+                and child.used_web_search
+                and not consents.web_has_consent(child.id)
+            ]
+            if direct_legacy_web_candidates:
+                web = min(direct_legacy_web_candidates, key=_message_time)
+            else:
+                following = ordered[index + 1] if index + 1 < len(ordered) else None
+                if (
+                    following is not None
+                    and following.role == "ASSISTANT"
+                    and following.parent_message_id is None
+                ):
+                    if following.used_web_search:
+                        if not consents.web_has_consent(following.id):
+                            web = following
+                    else:
+                        course = following
+
+        chosen = web or course
+        if chosen is None or chosen.id in used:
+            continue
+        if web is None and _is_refusal(course):
+            continue
+
+        used.add(user.id)
+        used.add(chosen.id)
+        if course is not None:
+            used.add(course.id)
+
+        answered_at = chosen.created_at or user.created_at or datetime.now(UTC)
+        turns.append(
+            {
+                "user_id": owner_id,
+                "answer_id": str(chosen.id),
+                "question": (user.content or "").strip(),
+                "answered_at": answered_at,
+                "is_web": web is not None,
+                "pedagogy": _pedagogy_from_trace(web or course),
+            }
+        )
+    return turns
 
 
 def _match_category_for_question(question_text: str, categories: list[ClassCategory]) -> uuid.UUID | None:
@@ -930,7 +1061,9 @@ def compute_content_gap_dashboard(
     cat_mat_keys: dict[uuid.UUID, set[tuple[uuid.UUID, str]]] = {cat.id: set() for cat in categories}
     cat_web_students: dict[uuid.UUID, set[uuid.UUID]] = {cat.id: set() for cat in categories}
     cat_questions: dict[uuid.UUID, list[tuple[uuid.UUID, str, str, datetime]]] = {cat.id: [] for cat in categories}
-    cat_all_questions: dict[uuid.UUID, list[tuple[uuid.UUID, str, str, datetime, bool]]] = {cat.id: [] for cat in categories}
+    cat_all_questions: dict[
+        uuid.UUID, list[tuple[uuid.UUID, str, str, datetime, bool, str | None]]
+    ] = {cat.id: [] for cat in categories}
     cat_mat_count: dict[uuid.UUID, int] = {cat.id: 0 for cat in categories}
 
     sessions: dict[uuid.UUID, list[ChatMessage]] = {}
@@ -939,37 +1072,67 @@ def compute_content_gap_dashboard(
         sessions.setdefault(sess.id, []).append(msg)
         session_users[sess.id] = sess.user_id
 
+    session_ids = list(sessions)
+    message_ids = {msg.id for msgs in sessions.values() for msg in msgs}
+    consent_rows = (
+        db.query(
+            ChatWebConsent.session_id,
+            ChatWebConsent.user_id,
+            ChatWebConsent.assistant_message_id,
+            ChatWebConsent.web_message_id,
+            ChatWebConsent.status,
+        )
+        .filter(
+            ChatWebConsent.session_id.in_(session_ids),
+            or_(
+                ChatWebConsent.assistant_message_id.in_(message_ids),
+                ChatWebConsent.web_message_id.in_(message_ids),
+            ),
+        )
+        .all()
+    )
+    consents_by_session: dict[uuid.UUID, list] = {}
+    for consent in consent_rows:
+        consents_by_session.setdefault(consent.session_id, []).append(consent)
+
     for sess_id, msgs in sessions.items():
-        user_id = session_users[sess_id]
-        for i in range(len(msgs) - 1):
-            curr_msg = msgs[i]
-            next_msg = msgs[i + 1]
-            if curr_msg.role == "USER" and next_msg.role == "ASSISTANT":
-                date_str = next_msg.created_at.strftime("%Y-%m-%d")
-                is_web = bool(next_msg.used_web_search)
-                question_text = curr_msg.content.strip()
-
-                # Extract chat-time pedagogy tag from assistant trace if present
-                pedagogy_tag = None
-                if next_msg.trace:
-                    for t in next_msg.trace:
-                        if isinstance(t, str) and t.startswith("pedagogy:"):
-                            pedagogy_tag = t.split(":", 1)[1]
-                            break
-
-                # Match question to best category dynamically via token & semantic overlap
-                best_cat_id = _match_category_for_question(question_text, categories)
-
-                if best_cat_id:
-                    dedup_key = (user_id, date_str)
-                    cat_all_questions[best_cat_id].append((user_id, str(next_msg.id), question_text, next_msg.created_at, is_web, pedagogy_tag))
-                    if is_web:
-                        cat_web_keys[best_cat_id].add(dedup_key)
-                        cat_web_students[best_cat_id].add(user_id)
-                        cat_questions[best_cat_id].append((user_id, str(next_msg.id), question_text, next_msg.created_at))
-                    else:
-                        cat_mat_keys[best_cat_id].add(dedup_key)
-                        cat_mat_count[best_cat_id] += 1
+        owner_id = session_users[sess_id]
+        consent_index = build_consent_index(
+            row for row in consents_by_session.get(sess_id, []) if row.user_id == owner_id
+        )
+        for turn in _content_gap_turns(
+            msgs,
+            consent_index,
+            owner_id=owner_id,
+        ):
+            user_id = turn["user_id"]
+            answered_at = turn["answered_at"]
+            date_str = answered_at.strftime("%Y-%m-%d") if answered_at else ""
+            is_web = bool(turn["is_web"])
+            question_text = turn["question"]
+            best_cat_id = _match_category_for_question(question_text, categories)
+            if not best_cat_id:
+                continue
+            dedup_key = (user_id, date_str)
+            cat_all_questions[best_cat_id].append(
+                (
+                    user_id,
+                    turn["answer_id"],
+                    question_text,
+                    answered_at,
+                    is_web,
+                    turn["pedagogy"],
+                )
+            )
+            if is_web:
+                cat_web_keys[best_cat_id].add(dedup_key)
+                cat_web_students[best_cat_id].add(user_id)
+                cat_questions[best_cat_id].append(
+                    (user_id, turn["answer_id"], question_text, answered_at)
+                )
+            else:
+                cat_mat_keys[best_cat_id].add(dedup_key)
+                cat_mat_count[best_cat_id] += 1
 
     # 5. Build Topic Reports
     topic_reports: list[ContentGapTopicReport] = []

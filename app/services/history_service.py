@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.config.config import settings
 from app.models.chat import ChatMessage, ChatSession
+from app.services import content_gap_telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,11 @@ def get_qdrant_client() -> Any | None:
     try:
         from qdrant_client import QdrantClient
 
-        return QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+        return QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key,
+            timeout=2.0,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not initialize QdrantClient in history service: %s", exc)
         return None
@@ -56,6 +61,7 @@ def sync_content_gap_query(
     concept_tag: str | None = None,
     embedding_model_version: str | None = None,
     qdrant_client: Any | None = None,
+    web_consumed: Callable[[], bool] | None = None,
 ) -> None:
     """Upsert question query embedding into Qdrant collection 'content_gap_queries' (AC-01, AC-03).
 
@@ -73,7 +79,9 @@ def sync_content_gap_query(
         from qdrant_client.http.models import PointStruct
 
         ensure_content_gap_collection(client)
-
+        effective_source = (
+            "web" if web_consumed is not None and web_consumed() else str(source)
+        )
         point = PointStruct(
             id=message_id,
             vector=embedding,
@@ -82,13 +90,22 @@ def sync_content_gap_query(
                 "class_id": str(class_id),
                 "student_id": str(student_id),
                 "timestamp": datetime.now(UTC).isoformat(),
-                "source": str(source),
+                "source": effective_source,
                 "fallback_reason": fallback_reason,
                 "concept_tag": concept_tag or "",
-                "embedding_model_version": embedding_model_version or settings.embedding_model,
+                "embedding_model_version": embedding_model_version
+                or settings.embedding_model,
             },
         )
         client.upsert(collection_name=CONTENT_GAP_COLLECTION, points=[point])
+        if effective_source != "web" and web_consumed is not None and web_consumed():
+            # The consent completed while the material upsert was running;
+            # correct the same point while the job still owns its state lock.
+            client.set_payload(
+                collection_name=CONTENT_GAP_COLLECTION,
+                payload={"source": "web"},
+                points=[str(message_id)],
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to sync content gap query to Qdrant: %s", exc)
 
@@ -98,22 +115,54 @@ def delete_content_gap_queries(
     qdrant_client: Any | None = None,
 ) -> None:
     """Delete points from Qdrant collection 'content_gap_queries' by message ID (AC-05)."""
+
     if not message_ids:
         return
 
+    keys = [str(message_id) for message_id in message_ids]
+    client = qdrant_client or get_qdrant_client()
+
+    def remove_points() -> None:
+        if client is None:
+            return
+        try:
+            from qdrant_client.http.models import PointIdsList
+
+            client.delete(
+                collection_name=CONTENT_GAP_COLLECTION,
+                points_selector=PointIdsList(points=keys),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to delete points from Qdrant content_gap_queries: %s", exc)
+
+    content_gap_telemetry.serialize_delete(remove_points, keys)
+
+
+def update_content_gap_source(
+    message_id: str,
+    *,
+    source: str = "web",
+    fallback_reason: str | None = None,
+    qdrant_client: Any | None = None,
+) -> None:
+    """Reuse the course point for a completed web fallback (no second vector)."""
+
+    if not message_id:
+        return
     client = qdrant_client or get_qdrant_client()
     if client is None:
         return
-
     try:
-        from qdrant_client.http.models import PointIdsList
-
-        client.delete(
+        payload: dict[str, Any] = {"source": str(source)}
+        if fallback_reason is not None:
+            payload["fallback_reason"] = fallback_reason
+        client.set_payload(
             collection_name=CONTENT_GAP_COLLECTION,
-            points_selector=PointIdsList(points=message_ids),
+            payload=payload,
+            points=[str(message_id)],
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to delete points from Qdrant content_gap_queries: %s", exc)
+        logger.warning("Failed to update content gap source in Qdrant: %s", exc)
 
 
 def get_sessions_by_class(
@@ -350,14 +399,21 @@ def save_chat_turn(
     concept_tag: str | None = None,
     qdrant_client: Any | None = None,
     excluded_from_context: bool = False,
+    sync_content_gap: bool = True,
 ) -> tuple[ChatSession, ChatMessage, ChatMessage]:
     """Persist a complete Q&A turn (User prompt + Assistant response) into the database (AC-01, AC-02, AC-03).
 
     1. If session_id is None, initializes a new session with title = first 50 chars of user query (AC-03).
     2. Persists USER message and ASSISTANT message (with used_web_search flag) (AC-02).
     3. Stores the assistant citations so history reloads keep the original answer traceable (AI-63 AC-03).
-    4. If used_web_search is True and query_embedding is provided, syncs to Qdrant content_gap_queries (AC-03).
-       NOTE: Strictly does NOT invoke Gemini Embedding API — reuses existing query_embedding.
+    4. If ``query_embedding`` is provided and ``sync_content_gap`` is true,
+       syncs one stable point to Qdrant ``content_gap_queries`` keyed by the
+       assistant message ID. Course turns use ``material``; a later consumed web
+       fallback updates that same point to ``web`` instead of adding a second
+       vector. Async callers that need a non-blocking stream pass
+       ``sync_content_gap=False`` and schedule telemetry separately.
+       NOTE: Strictly does NOT invoke Gemini Embedding API - reuses existing
+       query_embedding.
     5. ``excluded_from_context`` keeps a refused turn out of later prompts while
        leaving it visible when the conversation is reopened.
     """
@@ -424,14 +480,14 @@ def save_chat_turn(
     db.refresh(assistant_msg)
 
     # 3. Synchronize with Qdrant content_gap_queries (AC-01: record every query)
-    if query_embedding:
+    if query_embedding and sync_content_gap:
         sync_content_gap_query(
             message_id=str(assistant_msg.id),
             class_id=str(class_id),
             student_id=str(user_id),
             embedding=query_embedding,
             source="web" if used_web_search else "material",
-            fallback_reason=fallback_reason if used_web_search else None,
+            fallback_reason=fallback_reason,
             concept_tag=concept_tag,
             embedding_model_version=settings.embedding_model,
             qdrant_client=qdrant_client,
@@ -450,7 +506,9 @@ def delete_session(
 
     Order of operations:
     1. Check user ownership (403 if unauthorized, 404 if missing).
-    2. Collect message IDs with used_web_search=True and delete from Qdrant first.
+    2. Collect every assistant message ID in the session and delete its Qdrant
+       content-gap point first. Material, refused/none and web turns all share
+       the same point namespace; the web point reuses the course turn ID.
     3. Delete chat_session from PostgreSQL (cascades to chat_message).
     """
     session = db.scalar(select(ChatSession).where(ChatSession.id == session_id))
@@ -466,12 +524,14 @@ def delete_session(
             detail="Access forbidden: you do not own this chat session.",
         )
 
-    # 1. Identify Qdrant vector points to delete
+    # 1. Identify Qdrant vector points to delete. Every assistant message may
+    # own a point: course material/none turns create one, and a consumed web
+    # fallback updates that same point instead of creating a second one.
     gap_messages = (
         db.scalars(
             select(ChatMessage.id).where(
                 ChatMessage.session_id == session.id,
-                ChatMessage.used_web_search.is_(True),
+                ChatMessage.role == "ASSISTANT",
             )
         ).all()
     )
