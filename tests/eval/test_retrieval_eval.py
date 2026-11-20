@@ -133,6 +133,70 @@ def test_chunk_corpus_uses_the_production_chunkers(harness):
     assert all(chunk.metadata["embedding_text"] for chunk in small)
 
 
+def test_latency_percentiles_use_nearest_rank(harness):
+    """AI-162 AC-02: p50 and p95 are reported from the per-question latencies."""
+
+    def outcome(latency_ms: float):
+        return harness.QuestionOutcome("q", "q", ("a.md",), [], None, 0.45, latency_ms=latency_ms)
+
+    result = harness.ConfigurationResult(
+        chunk_size=800,
+        threshold=0.45,
+        top_k=3,
+        chunk_count=10,
+        outcomes=[outcome(value) for value in (10.0, 20.0, 30.0, 40.0, 100.0)],
+    )
+
+    assert result.latency_percentile(50) == pytest.approx(30.0)
+    assert result.latency_percentile(95) == pytest.approx(100.0)
+    assert result.as_dict()["p50_latency_ms"] == pytest.approx(30.0)
+    assert result.as_dict()["p95_latency_ms"] == pytest.approx(100.0)
+
+
+def test_rerank_comparison_pairs_on_and_off(harness):
+    """AI-162 AC-01/AC-02: on and off are compared for the same configuration."""
+
+    def result(rerank: bool, ranked: list, p50: float):
+        return harness.ConfigurationResult(
+            chunk_size=800,
+            threshold=0.45,
+            top_k=3,
+            chunk_count=10,
+            rerank=rerank,
+            outcomes=[
+                harness.QuestionOutcome(
+                    "q", "q", ("a.md",), ranked, ranked[0].score, 0.45, latency_ms=p50
+                )
+            ],
+            out_of_scope=[("x", 0.0, False)],
+        )
+
+    hit_first = [harness.RankedChunk("a", "a.md", 0.9, "")]
+    hit_second = [
+        harness.RankedChunk("b", "b.md", 0.9, ""),
+        harness.RankedChunk("a", "a.md", 0.8, ""),
+    ]
+    comparison = harness.rerank_comparison(
+        [result(True, hit_first, 1118.5), result(False, hit_second, 430.3)]
+    )
+
+    assert len(comparison["pairs"]) == 1
+    pair = comparison["pairs"][0]
+    assert pair["mrr_on"] == pytest.approx(1.0)
+    assert pair["mrr_off"] == pytest.approx(0.5)
+    assert pair["p50_ms_on"] == pytest.approx(1118.5)
+    assert pair["p50_ms_off"] == pytest.approx(430.3)
+
+
+def test_rerank_comparison_skips_unpaired_configurations(harness):
+    """A configuration measured in only one mode has no delta to report."""
+
+    only_on = harness.ConfigurationResult(
+        chunk_size=800, threshold=0.45, top_k=3, chunk_count=10, rerank=True
+    )
+    assert harness.rerank_comparison([only_on])["pairs"] == []
+
+
 def test_end_to_end_run_reports_every_metric(harness, tmp_path, capsys):
     """One command produces a report with all three metrics for every config."""
 
@@ -170,3 +234,42 @@ def test_end_to_end_run_reports_every_metric(harness, tmp_path, capsys):
         assert 0.0 <= row["hit_rate"] <= 1.0
         assert 0.0 <= row["mrr"] <= 1.0
         assert 0.0 <= row["false_not_found_rate"] <= 1.0
+        assert row["rerank"] is True
+        assert row["p50_latency_ms"] >= 0.0
+        assert row["p95_latency_ms"] >= row["p50_latency_ms"]
+
+
+def test_end_to_end_run_compares_reranker_on_and_off(harness, tmp_path, capsys):
+    """AI-162 AC-01: one command measures both modes and pairs them."""
+
+    report_path = tmp_path / "report.md"
+    exit_code = harness.main(
+        [
+            "--embedding",
+            "hashing",
+            "--rerank",
+            "both",
+            "--chunk-sizes",
+            "800",
+            "--thresholds",
+            "0.45",
+            "--top-ks",
+            "3",
+            "--report",
+            str(report_path),
+            "--json",
+            str(tmp_path / "report.json"),
+        ]
+    )
+    assert exit_code == 0
+    capsys.readouterr()
+
+    report = report_path.read_text(encoding="utf-8")
+    assert "Reranker on vs off" in report
+
+    data = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert [row["rerank"] for row in data["results"]] == [True, False]
+    pairs = data["rerank_comparison"]["pairs"]
+    assert len(pairs) == 1
+    assert pairs[0]["p50_ms_on"] >= 0.0
+    assert pairs[0]["p95_ms_on"] >= pairs[0]["p50_ms_on"]
