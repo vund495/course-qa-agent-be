@@ -41,13 +41,13 @@ def create_answer_ticket(db: Session, user: User, message_id: uuid.UUID, details
         return existing, False
     if answer.feedback != "not_helpful":
         raise HTTPException(409, "Save Not helpful feedback before creating a ticket.")
-    question = db.get(ChatMessage, answer.parent_message_id) if answer.parent_message_id else None
-    if question is None or question.role != "USER" or question.session_id != answer.session_id:
+    original_question = answer.original_question
+    if original_question is None:
         raise HTTPException(409, "The original question could not be identified.")
     try:
         ticket = create_student_ticket(
             db, student=user, class_id=answer.session.class_id,
-            question=question.content, original_question=question.content,
+            question=original_question, original_question=original_question,
             agent_answer=answer.content, citations=answer.citations or [],
             source_message_id=message_id, details=details,
         )

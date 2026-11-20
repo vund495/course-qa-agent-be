@@ -120,10 +120,27 @@ class ChatMessage(Base):
 
     @property
     def original_question(self) -> str | None:
-        """Return the linked USER prompt only when it belongs to this session."""
+        """Return the linked USER prompt only when it belongs to this session.
+
+        Consented web answers are threaded under the course answer they extend,
+        so their parent is an ASSISTANT message. Walk one extra hop to the USER
+        prompt that started the turn; otherwise a history reload loses the
+        "ask my teacher" action and the original-question link.
+        """
+
         parent = self.parent_message
-        if parent and parent.role == "USER" and parent.session_id == self.session_id:
+        if parent and parent.session_id != self.session_id:
+            return None
+        if parent and parent.role == "USER":
             return parent.content
+        if parent and parent.role == "ASSISTANT":
+            grandparent = parent.parent_message
+            if (
+                grandparent
+                and grandparent.role == "USER"
+                and grandparent.session_id == self.session_id
+            ):
+                return grandparent.content
         return None
 
     @property
