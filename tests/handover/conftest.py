@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,8 +16,28 @@ from app.config import settings
 from app.core.database import Base, get_session_local, reset_engine
 from app.core.deps import get_db
 from app.main import app
+from app.models.attendance import Holiday
 from app.models.course import Class, ClassTrainer, Enrollment
 from app.models.user import Role, User
+from app.services.holiday_service import local_date
+
+
+def _clear_today_system_holiday(db: Session) -> None:
+    """Keep handover router tests on a working day.
+
+    The app lifespan seeds the system holiday calendar, so when the suite runs
+    on a real holiday (e.g. 20/11) the leave/handover sweeps skip the day and
+    the flow assertions below silently stop exercising the code under test.
+    Holiday behaviour has dedicated coverage in ``tests/test_holiday_service.py``.
+    """
+    today = local_date(datetime.now(UTC))
+    removed = (
+        db.query(Holiday)
+        .filter(Holiday.date == today, Holiday.scope == "system")
+        .delete(synchronize_session=False)
+    )
+    if removed:
+        db.commit()
 
 
 @pytest.fixture()
@@ -124,5 +145,6 @@ def handover_client(handover_db: Session) -> Generator[TestClient, None, None]:
 
     app.dependency_overrides[get_db] = _override_db
     with TestClient(app) as test_client:
+        _clear_today_system_holiday(handover_db)
         yield test_client
     app.dependency_overrides.clear()

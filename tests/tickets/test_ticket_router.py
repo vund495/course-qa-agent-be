@@ -21,6 +21,7 @@ from app.models.email_outbox import EmailOutbox
 from app.models.system_config import SystemConfig
 from app.models.ticket import Ticket, TicketAttachment, TicketReply
 from app.models.user import Role, User
+from app.services.holiday_service import local_date
 from app.services.ticket_service import escalate_stale_tickets
 
 
@@ -127,8 +128,27 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
 
     app.dependency_overrides[get_db] = _override_db
     with TestClient(app) as test_client:
+        _clear_today_system_holiday(db_session)
         yield test_client
     app.dependency_overrides.clear()
+
+
+def _clear_today_system_holiday(db: Session) -> None:
+    """Keep escalation tests on a working day.
+
+    The app lifespan seeds the system holiday calendar, so when the suite runs
+    on a real holiday (e.g. 20/11) the holiday-aware SLA subtracts the whole
+    day and the stale-ticket assertions below never reach their SLA.
+    Holiday behaviour has dedicated coverage in ``test_holiday_pauses_the_escalation_sla``.
+    """
+    today = local_date(datetime.now(UTC))
+    removed = (
+        db.query(Holiday)
+        .filter(Holiday.date == today, Holiday.scope == "system")
+        .delete(synchronize_session=False)
+    )
+    if removed:
+        db.commit()
 
 
 def _headers(user_id: uuid.UUID, role: str = "student") -> dict[str, str]:
