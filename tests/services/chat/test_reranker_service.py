@@ -64,3 +64,50 @@ def test_rerank_chunks_orders_by_cross_encoder_logit(monkeypatch) -> None:
     assert [chunk.metadata["document_id"] for chunk in ranked] == ["b", "a"]
     assert captured["pairs"][0] == ("water cycle stages", "general water note")
     assert captured["max_length"] == reranker_service.MAX_SEQUENCE_LENGTH
+
+
+def test_reranker_is_enabled_by_default() -> None:
+    """AI-162: the measured default keeps the Cross Encoder on."""
+
+    from app.config import Settings
+
+    assert Settings(_env_file=None).reranker_enabled is True
+
+
+def test_disabled_reranker_keeps_vector_order_without_loading_the_model(monkeypatch) -> None:
+    """AI-162 AC-04: RERANKER_ENABLED=false skips the Cross Encoder entirely."""
+
+    chunks = [
+        ScoredChunk("first by cosine", 0.95, {"document_id": "a"}),
+        ScoredChunk("second by cosine", 0.70, {"document_id": "b"}),
+    ]
+
+    def fail_load():
+        raise AssertionError("Cross Encoder must not load when the reranker is off")
+
+    monkeypatch.setattr(reranker_service.settings, "reranker_enabled", False)
+    monkeypatch.setattr(reranker_service, "_load_model", fail_load)
+
+    ranked = reranker_service.rerank_all("water cycle stages", chunks)
+
+    assert [chunk.metadata["document_id"] for chunk in ranked] == ["a", "b"]
+    assert [chunk.score for chunk in ranked] == [0.95, 0.70]
+
+
+def test_disabled_reranker_skips_warm_up(monkeypatch) -> None:
+    """A deployment with the reranker off must not pay the model load at startup."""
+
+    loaded = False
+
+    def fake_load():
+        nonlocal loaded
+        loaded = True
+        return (None, None, "cpu")
+
+    monkeypatch.setattr(reranker_service.settings, "reranker_enabled", False)
+    monkeypatch.setattr(reranker_service, "_load_model", fake_load)
+    monkeypatch.delitem(sys.modules, "pytest", raising=False)
+
+    reranker_service.warm_up()
+
+    assert loaded is False
