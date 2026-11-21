@@ -201,6 +201,9 @@ def seed_database(db: Session) -> None:
         logger.error(f"Failed to seed initial data: {e}")
 
 
+
+
+
 DEV_CLASS = {
     "code": "TEST101-A",
     "name": "Test Class A",
