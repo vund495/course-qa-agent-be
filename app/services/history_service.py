@@ -9,12 +9,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config.config import settings
 from app.models.chat import ChatMessage, ChatSession
 from app.services import content_gap_telemetry
+from app.services.pagination import decode_cursor, encode_cursor
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +200,83 @@ def get_sessions_by_class(
     )
 
     return list(sessions), total
+
+
+CURSOR_SECTIONS = ("recent", "pinned")
+
+
+def get_sessions_cursor(
+    db: Session,
+    user_id: uuid.UUID,
+    section: str,
+    cursor: str | None = None,
+    class_id: uuid.UUID | None = None,
+    limit: int = 20,
+) -> tuple[list[ChatSession], int, str | None]:
+    """Keyset-paginate one sidebar section (AI-185 AC-01..AC-06).
+
+    ``recent`` orders by ``updated_at DESC, id DESC``; ``pinned`` orders by
+    ``pinned_at ASC, id ASC`` so the oldest pin stays on top (FIFO), matching
+    the client-side ordering in ``sortSessionsWithPinned``.
+
+    Raises ``InvalidCursorError`` when the cursor is malformed or belongs to the
+    other section. The caller maps that to HTTP 400.
+    """
+    if section not in CURSOR_SECTIONS:
+        raise ValueError(f"Unknown section: {section}")
+
+    base = select(ChatSession).where(ChatSession.user_id == user_id)
+    if class_id is not None:
+        base = base.where(ChatSession.class_id == class_id)
+
+    if section == "recent":
+        base = base.where(ChatSession.is_pinned.is_(False))
+        sort_column = ChatSession.updated_at
+        descending = True
+    else:
+        # A pinned row without a timestamp cannot be ordered, so it is excluded
+        # rather than silently dropped from the middle of a page.
+        base = base.where(
+            ChatSession.is_pinned.is_(True),
+            ChatSession.pinned_at.is_not(None),
+        )
+        sort_column = ChatSession.pinned_at
+        descending = False
+
+    total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+
+    if cursor:
+        cursor_ts, cursor_id = decode_cursor(cursor, section)
+        if descending:
+            base = base.where(
+                or_(
+                    sort_column < cursor_ts,
+                    and_(sort_column == cursor_ts, ChatSession.id < cursor_id),
+                )
+            )
+        else:
+            base = base.where(
+                or_(
+                    sort_column > cursor_ts,
+                    and_(sort_column == cursor_ts, ChatSession.id > cursor_id),
+                )
+            )
+
+    if descending:
+        ordering = (sort_column.desc(), ChatSession.id.desc())
+    else:
+        ordering = (sort_column.asc(), ChatSession.id.asc())
+
+    # One extra row tells us whether another page exists without a second query.
+    rows = list(db.scalars(base.order_by(*ordering).limit(limit + 1)).all())
+
+    next_cursor: str | None = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        last = rows[-1]
+        next_cursor = encode_cursor(section, getattr(last, sort_column.key), last.id)
+
+    return rows, total, next_cursor
 
 
 def get_session_messages(

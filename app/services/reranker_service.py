@@ -61,6 +61,9 @@ def warm_up() -> None:
     import sys
     if "pytest" in sys.modules:
         return
+    if not settings.reranker_enabled:
+        logger.info("Cross Encoder disabled (RERANKER_ENABLED=false); skipping warm-up.")
+        return
 
     try:
         _load_model()
@@ -110,10 +113,16 @@ def rerank_all(
     question: str,
     chunks: list[ScoredChunk],
 ) -> list[ScoredChunk]:
-    """Return all candidate chunks ranked and calibrated by Cross Encoder."""
+    """Return all candidate chunks ranked and calibrated by Cross Encoder.
+
+    When ``RERANKER_ENABLED`` is false the Cross Encoder is skipped entirely and
+    the candidates keep their vector-store order and cosine scores (AI-162).
+    """
 
     if not chunks:
         return []
+    if not settings.reranker_enabled:
+        return list(chunks)
 
     for chunk in chunks:
         if isinstance(chunk.metadata, dict):

@@ -17,7 +17,10 @@ CHAT_WEB_CONSENT_REVISION = "0049_chat_web_consent"
 TICKET_ATTACHMENT_NAMES_REVISION = "0050_ticket_attachment_names"
 CONSENT_ATTACHMENTS_MERGE_REVISION = "0051_merge_consent_attachments"
 EMAIL_OUTBOX_REVISION = "0051_email_outbox_timeline"
-HEAD_REVISION = "0052_merge_email_outbox_consent"
+EMAIL_MERGE_REVISION = "0052_merge_email_outbox_consent"
+SKILL_TAXONOMY_REVISION = "0053_global_skill_taxonomy"
+SKILL_BANK_REVISION = "0054_seed_skill_bank"
+HEAD_REVISION = "0055_chat_cursor_pagination"
 
 BASELINE_DDL = (
     'CREATE TABLE "user" (id CHAR(32) PRIMARY KEY)',
@@ -246,7 +249,13 @@ def test_graph_is_a_single_merge_head():
 
     assert script.get_heads() == [HEAD_REVISION]
     head = script.get_revision(HEAD_REVISION)
-    assert set(head.down_revision) == {
+    assert head.down_revision == SKILL_BANK_REVISION
+    skill_bank = script.get_revision(SKILL_BANK_REVISION)
+    assert skill_bank.down_revision == SKILL_TAXONOMY_REVISION
+    skill_taxonomy = script.get_revision(SKILL_TAXONOMY_REVISION)
+    assert skill_taxonomy.down_revision == EMAIL_MERGE_REVISION
+    email_merge = script.get_revision(EMAIL_MERGE_REVISION)
+    assert set(email_merge.down_revision) == {
         CONSENT_ATTACHMENTS_MERGE_REVISION,
         EMAIL_OUTBOX_REVISION,
     }

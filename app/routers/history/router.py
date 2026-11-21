@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import uuid
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_current_user, get_db
@@ -23,27 +24,68 @@ from app.schemas.history import (
     SessionRenameRequest,
 )
 from app.services import history_service, web_consent_service
+from app.services.pagination import InvalidCursorError
 
 router = APIRouter(prefix="/api/history", tags=["history"])
+
+CursorSection = Literal["recent", "pinned"]
 
 
 @router.get("", response_model=ChatSessionListResponse)
 def list_sessions(
     class_id: uuid.UUID | None = Query(default=None, description="Optional class ID filter"),
     limit: int = Query(default=50, ge=1, le=100, description="Max items per page"),
-    offset: int = Query(default=0, ge=0, description="Pagination offset"),
+    offset: int = Query(default=0, ge=0, description="Pagination offset (legacy mode)"),
+    section: CursorSection | None = Query(
+        default=None,
+        description=(
+            "Cursor mode section: 'recent' (updated_at DESC) or 'pinned' (pinned_at ASC). "
+            "Omit to use the legacy offset pagination."
+        ),
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque keyset cursor returned as next_cursor by the previous page",
+    ),
     current_user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Retrieve chat sessions for the authenticated user, ordered newest-first (AC-04, AC-06)."""
-    items, total = history_service.get_sessions_by_class(
-        db=db,
-        user_id=current_user.id,
-        class_id=class_id,
-        limit=limit,
-        offset=offset,
-    )
-    return ChatSessionListResponse(items=items, total=total)
+    """Retrieve chat sessions for the authenticated user (AC-04, AC-06, AI-185).
+
+    Without ``section`` the legacy offset path runs unchanged. With ``section``
+    the list is keyset-paginated and the response carries ``next_cursor``.
+    """
+    if section is None:
+        if cursor is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="cursor requires section.",
+            )
+        items, total = history_service.get_sessions_by_class(
+            db=db,
+            user_id=current_user.id,
+            class_id=class_id,
+            limit=limit,
+            offset=offset,
+        )
+        return ChatSessionListResponse(items=items, total=total)
+
+    try:
+        items, total, next_cursor = history_service.get_sessions_cursor(
+            db=db,
+            user_id=current_user.id,
+            section=section,
+            cursor=cursor,
+            class_id=class_id,
+            limit=limit,
+        )
+    except InvalidCursorError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    return ChatSessionListResponse(items=items, total=total, next_cursor=next_cursor)
 
 
 @router.get("/search", response_model=ChatSearchResponse)

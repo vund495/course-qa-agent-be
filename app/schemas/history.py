@@ -146,6 +146,9 @@ class ChatSessionListResponse(BaseModel):
 
     items: list[ChatSessionResponse] = Field(default_factory=list)
     total: int = 0
+    # AI-185: opaque keyset cursor for the next page. Null on the last page and
+    # always null in the legacy offset mode, so existing clients see no change.
+    next_cursor: str | None = None
 
 
 class PendingWebConsent(BaseModel):

@@ -100,6 +100,11 @@ class Settings(BaseSettings):
         default="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
         validation_alias="RERANKER_MODEL",
     )
+    # AI-162: measured on the AI-161 eval set. The Cross Encoder is what lifts
+    # MRR and separates in-scope from off-topic questions, so it stays on by
+    # default; set RERANKER_ENABLED=false to fall back to raw vector order.
+    # See docs/design/ai-162-reranker-default-decision.md.
+    reranker_enabled: bool = Field(default=True, validation_alias="RERANKER_ENABLED")
 
     llm_model: ClassVar[str] = "models/gemini-3.5-flash-lite"
     llm_temperature: float = Field(default=1.0, validation_alias="LLM_TEMPERATURE")

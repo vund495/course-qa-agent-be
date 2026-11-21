@@ -22,6 +22,7 @@ from app.core.database import Base
 if TYPE_CHECKING:
     from app.models.category import ClassCategory
     from app.models.document import Document
+    from app.models.skill import ClassSkill
 
 
 class Course(Base):
@@ -74,6 +75,9 @@ class Class(Base):
     )
     categories: Mapped[list["ClassCategory"]] = relationship(
         "ClassCategory", back_populates="clazz", cascade="all, delete-orphan"
+    )
+    skills: Mapped[list["ClassSkill"]] = relationship(
+        "ClassSkill", back_populates="clazz", cascade="all, delete-orphan"
     )
 
 
