@@ -5,10 +5,9 @@ Usage:
 """
 
 import logging
-import sys
-
-from pathlib import Path
 import runpy
+import sys
+from pathlib import Path
 
 from app.config import settings
 from app.core.database import get_session_local, init_engine

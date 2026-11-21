@@ -134,17 +134,19 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
 
 
 def _clear_today_system_holiday(db: Session) -> None:
-    """Keep escalation tests on a working day.
+    """Keep escalation tests calendar-independent.
 
-    The app lifespan seeds the system holiday calendar, so when the suite runs
-    on a real holiday (e.g. 20/11) the holiday-aware SLA subtracts the whole
-    day and the stale-ticket assertions below never reach their SLA.
-    Holiday behaviour has dedicated coverage in ``test_holiday_pauses_the_escalation_sla``.
+    The app lifespan seeds the system holiday calendar. A holiday anywhere in
+    the escalation window (the stale tickets below are 25 hours old) pauses the
+    holiday-aware SLA, so running the suite on or right after a holiday (e.g.
+    20/11) makes the assertions below fail. Drop the recent system holidays;
+    holiday behaviour has dedicated coverage in
+    ``test_holiday_pauses_the_escalation_sla``.
     """
-    today = local_date(datetime.now(UTC))
+    since = local_date(datetime.now(UTC)) - timedelta(days=7)
     removed = (
         db.query(Holiday)
-        .filter(Holiday.date == today, Holiday.scope == "system")
+        .filter(Holiday.date >= since, Holiday.scope == "system")
         .delete(synchronize_session=False)
     )
     if removed:

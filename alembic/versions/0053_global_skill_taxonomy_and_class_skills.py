@@ -15,6 +15,23 @@ branch_labels = None
 depends_on = None
 
 
+def _is_sqlite() -> bool:
+    return op.get_bind().dialect.name == "sqlite"
+
+
+def _seed_sql(sql: str) -> None:
+    """Run the PostgreSQL-only data statements, skipping SQLite.
+
+    The statements below rely on gen_random_uuid(), now(), ON CONFLICT,
+    UPDATE ... FROM and DELETE ... USING, which SQLite does not implement.
+    Production runs PostgreSQL, so the data migration still runs there
+    unchanged; SQLite is only used by the migration-graph tests, which assert
+    the schema, not the seeded rows.
+    """
+    if not _is_sqlite():
+        op.execute(sql)
+
+
 def upgrade() -> None:
     # 1. Create skill_group table (top-level topics: Java, Python, SQL...)
     op.create_table(
@@ -51,19 +68,20 @@ def upgrade() -> None:
         batch.add_column(sa.Column("classification", sa.String(50), nullable=True))
         batch.alter_column("class_id", existing_type=sa.Uuid(), nullable=True)
 
-    op.create_foreign_key(
-        "fk_skill_group_id",
-        "skill",
-        "skill_group",
-        ["group_id"],
-        ["id"],
-        ondelete="CASCADE",
-    )
+    if not _is_sqlite():
+        op.create_foreign_key(
+            "fk_skill_group_id",
+            "skill",
+            "skill_group",
+            ["group_id"],
+            ["id"],
+            ondelete="CASCADE",
+        )
     op.create_index("ix_skill_group_id", "skill", ["group_id"])
     op.create_index("ix_skill_display_id", "skill", ["display_id"])
 
     # 4. Migrate existing class skills into class_skill table
-    op.execute("""
+    _seed_sql("""
         INSERT INTO class_skill (id, class_id, skill_id, created_at)
         SELECT gen_random_uuid(), s.class_id, s.id, now()
         FROM skill s
@@ -78,7 +96,7 @@ def upgrade() -> None:
         pass
 
     # Deduplicate codes if any class created duplicate codes
-    op.execute("""
+    _seed_sql("""
         WITH ranked_skills AS (
             SELECT id, code,
                    ROW_NUMBER() OVER (PARTITION BY code ORDER BY created_at ASC, id ASC) as rn,
@@ -90,7 +108,7 @@ def upgrade() -> None:
         FROM ranked_skills rs
         WHERE qq.skill_id = rs.id AND rs.rn > 1;
     """)
-    op.execute("""
+    _seed_sql("""
         WITH ranked_skills AS (
             SELECT id, code,
                    ROW_NUMBER() OVER (PARTITION BY code ORDER BY created_at ASC, id ASC) as rn
@@ -100,7 +118,7 @@ def upgrade() -> None:
         USING ranked_skills rs
         WHERE slr.skill_id = rs.id AND rs.rn > 1;
     """)
-    op.execute("""
+    _seed_sql("""
         WITH ranked_skills AS (
             SELECT id, code,
                    ROW_NUMBER() OVER (PARTITION BY code ORDER BY created_at ASC, id ASC) as rn
@@ -117,7 +135,7 @@ def upgrade() -> None:
         pass
 
     # 6. Seed initial Skill Groups (English content matching system)
-    op.execute("""
+    _seed_sql("""
         INSERT INTO skill_group (id, code, name, description, created_at, updated_at)
         VALUES
             ('a0000000-0000-0000-0000-000000000001', 'JAVA', 'Java Ecosystem', 'Core Java programming, Object-Oriented principles, and enterprise frameworks.', now(), now()),
@@ -127,7 +145,7 @@ def upgrade() -> None:
     """)
 
     # 7. Seed initial Sub-skills (with sequential ID 1..6)
-    op.execute("""
+    _seed_sql("""
         INSERT INTO skill (id, display_id, group_id, code, name, domain, sub_domain, skill_family, classification, category, description, created_at, updated_at)
         VALUES
             ('b0000000-0000-0000-0000-000000000001', '1', 'a0000000-0000-0000-0000-000000000001', 'JAVA_OOP', 'Object-Oriented Programming in Java', 'Information Technology', 'Software Engineering', 'Programming Languages', 'Technical Skill', 'JAVA', 'Encapsulation, inheritance, polymorphism, abstract classes, and interfaces.', now(), now()),
@@ -185,7 +203,7 @@ def upgrade() -> None:
     ]
 
     for s_id, lvl, desc, th in rubrics_data:
-        op.execute(f"""
+        _seed_sql(f"""
             INSERT INTO skill_level_rubric (id, skill_id, level, description, threshold_pct, created_at, updated_at)
             VALUES (gen_random_uuid(), '{s_id}', '{lvl}', '{desc}', {th}, now(), now())
             ON CONFLICT (skill_id, level) DO NOTHING;
@@ -193,9 +211,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_index("ix_skill_group_id", table_name="skill")
+    op.drop_index("ix_skill_display_id", table_name="skill")
     op.drop_table("class_skill")
     with op.batch_alter_table("skill") as batch:
-        batch.drop_constraint("fk_skill_group_id", type_="foreignkey")
+        if not _is_sqlite():
+            batch.drop_constraint("fk_skill_group_id", type_="foreignkey")
         batch.drop_column("group_id")
         batch.drop_column("display_id")
         batch.drop_column("domain")

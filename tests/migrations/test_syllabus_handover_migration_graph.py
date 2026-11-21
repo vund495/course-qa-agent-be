@@ -27,6 +27,29 @@ BASELINE_DDL = (
     'CREATE TABLE "class" (id CHAR(32) PRIMARY KEY)',
     'CREATE TABLE "document" (id CHAR(32) PRIMARY KEY)',
     'CREATE TABLE "ticket" (id CHAR(32) PRIMARY KEY, class_id CHAR(32), trainer_id CHAR(32))',
+    # 0053 alters the class-scoped skill table from 0041, 0054 seeds
+    # skill/skill_group/skill_level_rubric, and 0055 indexes chat_session.
+    # Those tables predate 0040 in a real database but live on other branches
+    # of the migration graph, so recreate their pre-0053 shape for SQLite.
+    (
+        'CREATE TABLE "skill" ('
+        "id CHAR(32) PRIMARY KEY, class_id CHAR(32), code VARCHAR(100) NOT NULL, "
+        "name VARCHAR(255) NOT NULL, category VARCHAR(100) NOT NULL DEFAULT 'GENERAL', "
+        "description TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, "
+        "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL)"
+    ),
+    (
+        'CREATE TABLE "skill_level_rubric" ('
+        "id CHAR(32) PRIMARY KEY, skill_id CHAR(32) NOT NULL, level VARCHAR(20) NOT NULL, "
+        "description TEXT NOT NULL, threshold_pct INTEGER NOT NULL DEFAULT 70, "
+        "created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, "
+        "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL)"
+    ),
+    (
+        'CREATE TABLE "chat_session" ('
+        "id CHAR(32) PRIMARY KEY, user_id CHAR(32), "
+        "is_pinned BOOLEAN NOT NULL DEFAULT 0, updated_at DATETIME, pinned_at DATETIME)"
+    ),
 )
 
 

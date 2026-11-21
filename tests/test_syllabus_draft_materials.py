@@ -955,6 +955,37 @@ def test_migration_merge_upgrade_and_downgrade(tmp_path):
                 "id CHAR(32) PRIMARY KEY, target_trainer_id CHAR(32), reason TEXT)"
             )
         )
+        # 0053/0054/0055 touch the skill taxonomy and chat-session tables that
+        # predate this branch point; recreate their pre-0053 shape so this
+        # SQLite fixture can reach head.
+        conn.execute(
+            text(
+                'CREATE TABLE "skill" ('
+                "id CHAR(32) PRIMARY KEY, class_id CHAR(32), "
+                "code VARCHAR(100) NOT NULL, name VARCHAR(255) NOT NULL, "
+                "category VARCHAR(100) NOT NULL DEFAULT 'GENERAL', description TEXT, "
+                "created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, "
+                "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                'CREATE TABLE "skill_level_rubric" ('
+                "id CHAR(32) PRIMARY KEY, skill_id CHAR(32) NOT NULL, "
+                "level VARCHAR(20) NOT NULL, description TEXT NOT NULL, "
+                "threshold_pct INTEGER NOT NULL DEFAULT 70, "
+                "created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL, "
+                "updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL)"
+            )
+        )
+        conn.execute(
+            text(
+                'CREATE TABLE "chat_session" ('
+                "id CHAR(32) PRIMARY KEY, user_id CHAR(32), "
+                "is_pinned BOOLEAN NOT NULL DEFAULT 0, updated_at DATETIME, "
+                "pinned_at DATETIME)"
+            )
+        )
     engine.dispose()
 
     command.stamp(cfg, "0046_absence_handover")
