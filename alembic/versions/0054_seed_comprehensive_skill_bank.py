@@ -1,6 +1,6 @@
 """Seed comprehensive skill bank with 7 domains, 50+ differentiated technical skills, and Dreyfus rubrics.
 
-Revision ID: 0054_seed_comprehensive_skill_bank
+Revision ID: 0054_seed_skill_bank
 Revises: 0053_global_skill_taxonomy
 Create Date: 2026-11-20
 """
@@ -17,7 +17,7 @@ from app.models.skill import Skill, SkillGroup, SkillLevelRubric
 logger = logging.getLogger("alembic.migration.0054")
 
 # revision identifiers, used by Alembic.
-revision = "0054_seed_comprehensive_skill_bank"
+revision = "0054_seed_skill_bank"
 down_revision = "0053_global_skill_taxonomy"
 branch_labels = None
 depends_on = None
