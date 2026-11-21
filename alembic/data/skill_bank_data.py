@@ -9,7 +9,7 @@ import uuid
 # Fixed deterministic UUIDs for Groups
 GROUP_PYTHON_ID = uuid.UUID("a0000000-0000-0000-0000-000000000002")
 GROUP_JAVA_ID = uuid.UUID("a0000000-0000-0000-0000-000000000001")
-GROUP_DATABASE_ID = uuid.UUID("a0000000-0000-0000-0000-000000000003")
+GROUP_DATABASE_ID = uuid.UUID("a0000000-0000-0000-0000-000000000008")
 GROUP_SYSTEMS_ID = uuid.UUID("a0000000-0000-0000-0000-000000000004")
 GROUP_DEVOPS_ID = uuid.UUID("a0000000-0000-0000-0000-000000000005")
 GROUP_FRONTEND_ID = uuid.UUID("a0000000-0000-0000-0000-000000000006")
@@ -305,7 +305,7 @@ SKILLS_BANK = [
         },
     },
     {
-        "id": uuid.UUID("b0000000-0000-0000-0000-000000000002"),
+        "id": uuid.UUID("b0000000-0000-0000-0000-000000000013"),
         "code": "JAVA_SPRING_BOOT",
         "name": "Spring Boot (Java Framework)",
         "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000001"),
@@ -455,10 +455,10 @@ SKILLS_BANK = [
         },
     },
     {
-        "id": uuid.UUID("b0000000-0000-0000-0000-000000000005"),
+        "id": uuid.UUID("b0000000-0000-0000-0000-000000000014"),
         "code": "SQL_POSTGRES_QUERY",
         "name": "PostgreSQL Querying & Joins (SQL)",
-        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000003"),
+        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000008"),
         "domain": "Information Technology",
         "sub_domain": "Database Systems",
         "skill_family": "Database Management",
@@ -485,10 +485,10 @@ SKILLS_BANK = [
         },
     },
     {
-        "id": uuid.UUID("b0000000-0000-0000-0000-000000000006"),
+        "id": uuid.UUID("b0000000-0000-0000-0000-000000000015"),
         "code": "SQL_INDEX_PERF",
         "name": "Indexing & Query Optimization (Database)",
-        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000003"),
+        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000008"),
         "domain": "Information Technology",
         "sub_domain": "Database Systems",
         "skill_family": "Database Administration",
@@ -518,7 +518,7 @@ SKILLS_BANK = [
         "id": uuid.UUID("b0000000-0000-0000-0000-000000000008"),
         "code": "DB_FLYWAY",
         "name": "Flyway (Database Migration Tool)",
-        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000003"),
+        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000008"),
         "domain": "Information Technology",
         "sub_domain": "Information Technology",
         "skill_family": "Software Development Tools",
@@ -548,7 +548,7 @@ SKILLS_BANK = [
         "id": uuid.UUID("b0000000-0000-0000-0000-000000000009"),
         "code": "DB_DATA_MODELING",
         "name": "Relational Data Modeling (Database)",
-        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000003"),
+        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000008"),
         "domain": "Information Technology",
         "sub_domain": "Database Systems",
         "skill_family": "Data Modeling",
@@ -578,7 +578,7 @@ SKILLS_BANK = [
         "id": uuid.UUID("c0fcabb2-8caa-54b0-bd7d-655b9782b517"),
         "code": "DB_REDIS",
         "name": "Redis (In-Memory Database Tool)",
-        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000003"),
+        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000008"),
         "domain": "Information Technology",
         "sub_domain": "Database Systems",
         "skill_family": "NoSQL & Caching",
@@ -608,7 +608,7 @@ SKILLS_BANK = [
         "id": uuid.UUID("ebac1214-45ac-5ff1-840e-4d8e753bba1b"),
         "code": "DB_TRANSACTIONS",
         "name": "Database Transactions & ACID Isolation (SQL)",
-        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000003"),
+        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000008"),
         "domain": "Information Technology",
         "sub_domain": "Database Systems",
         "skill_family": "Database Engineering",
@@ -1388,7 +1388,7 @@ SKILLS_BANK = [
         "id": uuid.UUID("b75af741-ccb9-5285-b747-8d43a9ec161e"),
         "code": "DB_MONGODB",
         "name": "MongoDB (NoSQL Document Database)",
-        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000003"),
+        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000008"),
         "domain": "Information Technology",
         "sub_domain": "Database Systems",
         "skill_family": "NoSQL Databases",
@@ -1418,7 +1418,7 @@ SKILLS_BANK = [
         "id": uuid.UUID("57dbc60b-f685-516b-85b0-4e92eed78d1d"),
         "code": "DB_LIQUIBASE",
         "name": "Liquibase (Database Change Management Tool)",
-        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000003"),
+        "group_id": uuid.UUID("a0000000-0000-0000-0000-000000000008"),
         "domain": "Information Technology",
         "sub_domain": "Information Technology",
         "skill_family": "Software Development Tools",

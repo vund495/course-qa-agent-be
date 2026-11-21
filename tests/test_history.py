@@ -1050,3 +1050,373 @@ def test_search_title_match_takes_priority_over_message(
     assert res.status_code == 200
     assert res.json()["items"][0]["session_id"] == session_id
     assert res.json()["items"][0]["match_in"] == "title"
+
+
+# --- AI-185: Cursor pagination ---
+
+
+def _create_cursor_session(
+    client: TestClient,
+    headers: dict[str, str],
+    class_id: str,
+    title: str,
+    db: Session,
+    updated_at: datetime | None = None,
+    is_pinned: bool = False,
+    pinned_at: datetime | None = None,
+) -> str:
+    """Create a session and optionally control its sort timestamps directly.
+
+    SQLite is fast enough that several sessions may share the same
+    ``updated_at`` second; tests that need a deterministic order set the
+    timestamp explicitly. ``pinned_at`` is kept in lockstep with ``is_pinned``
+    because the cursor section predicate requires both.
+    """
+    res = client.post(
+        "/api/history/sessions",
+        headers=headers,
+        json={"class_id": class_id, "title": title},
+    )
+    assert res.status_code == 201, res.text
+    session_id = res.json()["id"]
+    if updated_at is not None or is_pinned:
+        session = db.get(ChatSession, uuid.UUID(session_id))
+        assert session is not None
+        if updated_at is not None:
+            session.updated_at = updated_at
+        if is_pinned:
+            session.is_pinned = True
+            session.pinned_at = pinned_at or updated_at or datetime.now(UTC)
+        db.commit()
+    return session_id
+
+
+def _sweep_cursor(
+    client: TestClient,
+    headers: dict[str, str],
+    section: str,
+    class_id: str,
+    limit: int,
+) -> list[str]:
+    """Page through every cursor page and return the ordered id list."""
+    ids: list[str] = []
+    cursor: str | None = None
+    while True:
+        params = {"section": section, "class_id": class_id, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        res = client.get("/api/history", params=params, headers=headers)
+        assert res.status_code == 200, res.text
+        body = res.json()
+        ids.extend(item["id"] for item in body["items"])
+        cursor = body["next_cursor"]
+        if cursor is None:
+            return ids
+
+
+def test_cursor_sweep_returns_every_session_once(
+    client: TestClient, db_session: Session
+) -> None:
+    """AC-05: A full cursor sweep returns every session exactly once, in order."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    base = datetime.now(UTC) - timedelta(minutes=30)
+    expected: list[str] = []
+    for i in range(10):
+        sid = _create_cursor_session(
+            client,
+            headers,
+            class_id,
+            f"Cursor sweep {i}",
+            db_session,
+            updated_at=base + timedelta(minutes=i),
+        )
+        expected.append(sid)
+
+    got = _sweep_cursor(client, headers, "recent", class_id, limit=3)
+
+    # updated_at DESC, id DESC.
+    assert got == list(reversed(expected))
+    assert len(got) == len(set(got)) == 10
+
+
+def test_cursor_stable_when_updated_at_ties(
+    client: TestClient, db_session: Session
+) -> None:
+    """AC-04: Equal updated_at values are broken by id so no row is skipped."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    shared = datetime.now(UTC) - timedelta(hours=1)
+    ids = [
+        _create_cursor_session(
+            client, headers, class_id, f"Tie {i}", db_session, updated_at=shared
+        )
+        for i in range(5)
+    ]
+
+    got = _sweep_cursor(client, headers, "recent", class_id, limit=2)
+
+    assert got == sorted(ids, reverse=True)
+    assert len(got) == 5
+
+
+def test_cursor_insert_between_pages_has_no_duplicate_or_gap(
+    client: TestClient, db_session: Session
+) -> None:
+    """AC-06: A session created mid-pagination is not duplicated or skipped."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    base = datetime.now(UTC) - timedelta(minutes=30)
+    original: list[str] = []
+    for i in range(5):
+        original.append(
+            _create_cursor_session(
+                client, headers, class_id, f"Before {i}", db_session,
+                updated_at=base + timedelta(minutes=i),
+            )
+        )
+
+    res = client.get(
+        "/api/history", params={"section": "recent", "class_id": class_id, "limit": 3},
+        headers=headers,
+    )
+    assert res.status_code == 200
+    first_page = [item["id"] for item in res.json()["items"]]
+    cursor = res.json()["next_cursor"]
+    assert cursor is not None
+    assert len(first_page) == 3
+
+    # A brand-new session lands on top of the recent list.
+    inserted = _create_cursor_session(
+        client, headers, class_id, "Inserted mid-pagination", db_session,
+        updated_at=base + timedelta(minutes=60),
+    )
+
+    other = _login(client, "teacher@academic.edu.vn", "Teacher@123")
+    _create_cursor_session(
+        client, other, class_id, "Other user", db_session,
+        updated_at=base + timedelta(minutes=61),
+    )
+
+    res2 = client.get(
+        "/api/history",
+        params={"section": "recent", "class_id": class_id, "limit": 3, "cursor": cursor},
+        headers=headers,
+    )
+    assert res2.status_code == 200
+    second_page = [item["id"] for item in res2.json()["items"]]
+
+    # The new top row is not repeated (keyset resumes strictly after the
+    # cursor), and no original row is skipped.
+    assert inserted not in first_page
+    assert inserted not in second_page
+    seen = first_page + second_page
+    assert len(seen) == len(set(seen))
+    assert set(seen) == set(original)
+
+
+def test_cursor_next_cursor_is_null_on_last_page(
+    client: TestClient, db_session: Session
+) -> None:
+    """AC-03: The final page carries next_cursor=null, signalling the end."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    for i in range(4):
+        _create_cursor_session(
+            client, headers, class_id, f"Last page {i}", db_session,
+            updated_at=datetime.now(UTC) - timedelta(minutes=30 - i),
+        )
+
+    res = client.get(
+        "/api/history", params={"section": "recent", "class_id": class_id, "limit": 4},
+        headers=headers,
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert len(body["items"]) == 4
+    assert body["next_cursor"] is None
+
+
+def test_cursor_rejects_malformed_cursor(client: TestClient) -> None:
+    """A tampered or non-cursor value is rejected with 400."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+
+    for bad in ("not-a-cursor", "###", "aGVsbG8="):
+        res = client.get(
+            "/api/history",
+            params={"section": "recent", "cursor": bad},
+            headers=headers,
+        )
+        assert res.status_code == 400, f"cursor={bad!r} -> {res.status_code}"
+
+
+def test_cursor_rejects_cursor_from_other_section(
+    client: TestClient, db_session: Session
+) -> None:
+    """A 'recent' cursor cannot drive the 'pinned' section (and vice versa)."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    sid = _create_cursor_session(
+        client, headers, class_id, "Section mismatch", db_session,
+        updated_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+    _create_cursor_session(
+        client, headers, class_id, "Section mismatch 2", db_session,
+        updated_at=datetime.now(UTC) - timedelta(minutes=6),
+    )
+
+    res = client.get(
+        "/api/history", params={"section": "recent", "class_id": class_id, "limit": 1},
+        headers=headers,
+    )
+    assert res.status_code == 200
+    recent_cursor = res.json()["next_cursor"]
+    assert recent_cursor is not None
+    assert res.json()["items"][0]["id"] == sid
+
+    res2 = client.get(
+        "/api/history",
+        params={"section": "pinned", "class_id": class_id, "cursor": recent_cursor},
+        headers=headers,
+    )
+    assert res2.status_code == 400
+
+
+def test_cursor_requires_section_when_cursor_present(client: TestClient) -> None:
+    """Passing a cursor without section is an API error (400)."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    res = client.get("/api/history", params={"cursor": "abc"}, headers=headers)
+    assert res.status_code == 400
+
+
+def test_cursor_only_returns_current_users_sessions(
+    client: TestClient, db_session: Session
+) -> None:
+    """RLS: Cursor mode never leaks another user's sessions."""
+    student_headers = _login(client, "student@academic.edu.vn", "Student@123")
+    trainer_headers = _login(client, "teacher@academic.edu.vn", "Teacher@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    own = _create_cursor_session(
+        client, student_headers, class_id, "Mine", db_session,
+        updated_at=datetime.now(UTC) - timedelta(minutes=10),
+    )
+    _create_cursor_session(
+        client, trainer_headers, class_id, "Not mine", db_session,
+        updated_at=datetime.now(UTC) - timedelta(minutes=9),
+    )
+
+    got = _sweep_cursor(client, student_headers, "recent", class_id, limit=1)
+
+    assert got == [own]
+
+
+def test_cursor_respects_class_id_filter(
+    client: TestClient, db_session: Session
+) -> None:
+    """Cursor mode honours the same class_id scope as the legacy endpoint."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    second_class = Class(
+        trainer_id=db_session.query(User).filter(User.email == "teacher@academic.edu.vn").first().id,
+        code="CS201-B",
+        name="Class B",
+        semester="1",
+        academic_year="2026-2027",
+    )
+    db_session.add(second_class)
+    db_session.commit()
+    second_class_id = str(second_class.id)
+
+    a = _create_cursor_session(
+        client, headers, class_id, "In class A", db_session,
+        updated_at=datetime.now(UTC) - timedelta(minutes=10),
+    )
+    b = _create_cursor_session(
+        client, headers, second_class_id, "In class B", db_session,
+        updated_at=datetime.now(UTC) - timedelta(minutes=9),
+    )
+
+    got_a = _sweep_cursor(client, headers, "recent", class_id, limit=1)
+    got_b = _sweep_cursor(client, headers, "recent", second_class_id, limit=1)
+
+    assert got_a == [a]
+    assert got_b == [b]
+
+
+def test_pinned_section_orders_by_pinned_at_ascending(
+    client: TestClient, db_session: Session
+) -> None:
+    """AC-04: The pinned block is FIFO — oldest pin first."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    base = datetime.now(UTC) - timedelta(hours=3)
+    newer = _create_cursor_session(
+        client, headers, class_id, "Pinned newer", db_session,
+        updated_at=base + timedelta(hours=2),
+        is_pinned=True, pinned_at=base + timedelta(hours=2),
+    )
+    older = _create_cursor_session(
+        client, headers, class_id, "Pinned older", db_session,
+        updated_at=base + timedelta(hours=1),
+        is_pinned=True, pinned_at=base + timedelta(hours=1),
+    )
+    unpinned = _create_cursor_session(
+        client, headers, class_id, "Not pinned", db_session,
+        updated_at=base + timedelta(hours=3),
+    )
+
+    got = _sweep_cursor(client, headers, "pinned", class_id, limit=1)
+
+    assert got == [older, newer]
+    assert unpinned not in got
+
+
+def test_legacy_offset_mode_still_works(
+    client: TestClient, db_session: Session
+) -> None:
+    """AC-02: Without 'section', the legacy offset path stays unchanged."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    base = datetime.now(UTC) - timedelta(minutes=30)
+    for i in range(8):
+        _create_cursor_session(
+            client, headers, class_id, f"Legacy {i}", db_session,
+            updated_at=base + timedelta(minutes=i),
+        )
+
+    res = client.get(
+        "/api/history",
+        params={"class_id": class_id, "offset": 2, "limit": 3},
+        headers=headers,
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 8
+    assert len(body["items"]) == 3
+    assert body["next_cursor"] is None
+
+
+def test_legacy_response_has_null_next_cursor(
+    client: TestClient, db_session: Session
+) -> None:
+    """AC-02: A legacy response never advertises a cursor continuation."""
+    headers = _login(client, "student@academic.edu.vn", "Student@123")
+    class_id = str(_get_test_class_id(db_session))
+
+    _create_cursor_session(
+        client, headers, class_id, "Legacy null", db_session,
+        updated_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+
+    res = client.get("/api/history", params={"class_id": class_id}, headers=headers)
+    assert res.status_code == 200
+    assert res.json()["next_cursor"] is None
